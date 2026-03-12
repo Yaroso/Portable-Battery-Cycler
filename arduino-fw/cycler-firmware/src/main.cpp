@@ -113,3 +113,14 @@ void handleSerialCommands() {
         }
     }
 }
+
+
+// ==========================================
+// EMPIRICAL CALIBRATION CONSTANTS
+// TODO: Map PWM vs DMM Current to find true linear transfer function (y = mx + c)
+// Current_mA = (ADC_Reading * CURRENT_SLOPE_M) + CURRENT_INTERCEPT_C
+// ==========================================
+//UNCOMMENT const float CURRENT_SLOPE_M = 0.0718;       // Replace with empirical 'm'
+//UNCOMMENT const float CURRENT_INTERCEPT_C = 0.0000;   // Replace with empirical 'c'
+// Note: Supercaps have extremely low ESR. Current will spike hard. 
+// Ensure PID/Control loop is sufficiently damped before connecting one.
