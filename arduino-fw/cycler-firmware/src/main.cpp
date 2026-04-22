@@ -1,6 +1,6 @@
 /**
- * PUDELstat Firmware - Full System Integration
- * Features: Auto-Zero, Moving Avg, Hardware Latch, Graceful Software OVP
+ * PUDELstat Firmware - Load-Aware State Machine
+ * Features: Chemistry Guardrails, Auto-Zero, Moving Avg, Hardware Latch
  */
 
 #include <Arduino.h>
@@ -16,9 +16,12 @@ float CURRENT_ZERO_ADC = 512.0;
 const float ADC_CURR_GAIN_MA = 0.0718; 
 const float ADC_VOLT_GAIN = (5.00 / 1023.0);
 
-enum SystemState { AWAITING_TARGET, IDLE, RUNNING, ERROR, CHARGE_COMPLETE };
-SystemState currentState = AWAITING_TARGET;
+enum SystemState { AWAITING_LOAD, AWAITING_TARGET, IDLE, RUNNING, ERROR, CHARGE_COMPLETE };
+SystemState currentState = AWAITING_LOAD;
 
+String currentLoadName = "NONE";
+float maxAllowableCeiling = 0.0;
+float safeFloorVoltage = 0.0;
 float targetVoltage = 0.0;
 uint8_t currentPWMCommand = 127;
 
@@ -65,8 +68,8 @@ void setup() {
     
     Serial.print("CALIBRATION COMPLETE. True Zero ADC: ");
     Serial.println(CURRENT_ZERO_ADC, 2);
-    Serial.println("\n>>> SYSTEM LOCKED. Set target voltage first.");
-    Serial.println(">>> Send 'TARGET <volts>' (e.g., 'TARGET 2.3')");
+    Serial.println("\n>>> SYSTEM LOCKED. Select Load Type First.");
+    Serial.println(">>> Send 'LOAD SUPERCAP', 'LOAD NIMH', 'LOAD RESISTOR', or 'LOAD CUSTOM'.");
 }
 
 void loop() {
@@ -94,7 +97,7 @@ void loop() {
     float c = ((sumCurr / 20.0) - CURRENT_ZERO_ADC) * ADC_CURR_GAIN_MA;
     float true_cap_voltage = absolute_ce - absolute_we;
     
-    // 3. GRACEFUL SOFTWARE CUTOFFS (Direction-Aware)
+    // 3. GRACEFUL SOFTWARE CUTOFFS
     if (currentState == RUNNING) {
         // CHARGE CUTOFF: Current flowing IN (PWM < 127)
         if (currentPWMCommand < 127 && true_cap_voltage >= targetVoltage) {
@@ -105,12 +108,11 @@ void loop() {
             Serial.println(">>> Current Halted. System CHARGE_COMPLETE.\n");
         }
         // DISCHARGE CUTOFF: Current flowing OUT (PWM > 127)
-        // Stops discharge at 0.05V to prevent negative polarity across the cap
-        else if (currentPWMCommand > 127 && true_cap_voltage <= 0.05) {
+        else if (currentPWMCommand > 127 && true_cap_voltage <= safeFloorVoltage) {
             setPWMDuty(127);
             currentPWMCommand = 127;
             currentState = IDLE;
-            Serial.println("\n>>> GRACEFUL STOP: Safe Discharge Floor (0.05V) Reached! <<<");
+            Serial.println("\n>>> GRACEFUL STOP: Safe Discharge Floor Reached! <<<");
             Serial.println(">>> Current Halted. System IDLE.\n");
         }
     }
@@ -121,8 +123,10 @@ void loop() {
             Serial.print(absolute_ce, 3); Serial.print("V (CE), ");
             Serial.print(absolute_we, 3); Serial.print("V (WE), LOCKED_ERROR");
         } else {
-            Serial.print("State: "); 
-            if (currentState == AWAITING_TARGET) Serial.print("WAIT_TGT | ");
+            Serial.print("Load: "); Serial.print(currentLoadName); Serial.print(" | State: "); 
+            
+            if (currentState == AWAITING_LOAD) Serial.print("WAIT_LOAD | ");
+            else if (currentState == AWAITING_TARGET) Serial.print("WAIT_TGT | ");
             else if (currentState == IDLE) Serial.print("IDLE | ");
             else if (currentState == CHARGE_COMPLETE) Serial.print("DONE | ");
             else if (currentState == RUNNING && currentPWMCommand < 127) Serial.print("CHARGING | ");
@@ -154,27 +158,66 @@ void handleSerialCommands() {
     if (Serial.available() > 0) {
         String cmd = Serial.readStringUntil('\n');
         cmd.trim();
+        cmd.toUpperCase(); 
         
         if (currentState == ERROR) {
             Serial.println(">>> REJECTED: SYSTEM IS IN ERROR LOCKOUT.");
             return;
         }
 
-        if (cmd.startsWith("TARGET ")) {
-            targetVoltage = cmd.substring(7).toFloat();
-            if (targetVoltage > 0.1 && targetVoltage <= 4.8) {
+        if (cmd.startsWith("LOAD ")) {
+            String type = cmd.substring(5);
+            if (type == "SUPERCAP") {
+                currentLoadName = "SUPERCAP";
+                safeFloorVoltage = 0.05;
+                maxAllowableCeiling = 2.30;
+            } else if (type == "NIMH") {
+                currentLoadName = "NIMH";
+                safeFloorVoltage = 1.00;
+                maxAllowableCeiling = 1.45;
+            } else if (type == "RESISTOR") {
+                currentLoadName = "RESISTOR";
+                safeFloorVoltage = -2.30;
+                maxAllowableCeiling = 2.30;
+            } else if (type == "CUSTOM") {
+                currentLoadName = "CUSTOM";
+                safeFloorVoltage = -4.80;
+                maxAllowableCeiling = 4.80;
+            } else {
+                Serial.println(">>> ERROR: Unknown load type.");
+                return;
+            }
+            
+            currentState = AWAITING_TARGET;
+            setPWMDuty(127); 
+            currentPWMCommand = 127;
+            Serial.print("\n>>> LOAD SET: "); Serial.println(currentLoadName);
+            Serial.print(">>> Guardrails Locked -> Floor: "); Serial.print(safeFloorVoltage, 2);
+            Serial.print("V, Ceiling: "); Serial.print(maxAllowableCeiling, 2); Serial.println("V");
+            Serial.println(">>> Send 'TARGET <volts>' to set your charge limit.\n");
+        }
+        else if (cmd.startsWith("TARGET ")) {
+            if (currentState == AWAITING_LOAD) {
+                Serial.println(">>> REJECTED: You must select a LOAD type first.");
+                return;
+            }
+            float requestedTarget = cmd.substring(7).toFloat();
+            if (requestedTarget >= safeFloorVoltage && requestedTarget <= maxAllowableCeiling) {
+                targetVoltage = requestedTarget;
                 currentState = IDLE;
                 Serial.print("\n>>> UPPER TARGET SET: "); 
                 Serial.print(targetVoltage, 2); 
                 Serial.println("V");
                 Serial.println(">>> Send 'PWM <0-126>' to Charge. Send 'PWM <128-255>' to Discharge.\n");
             } else {
-                Serial.println(">>> ERROR: Invalid target. Must be > 0.1V and <= 4.8V");
+                Serial.print(">>> ERROR: Target must be between ");
+                Serial.print(safeFloorVoltage, 2); Serial.print("V and ");
+                Serial.print(maxAllowableCeiling, 2); Serial.println("V for this load.");
             }
         } 
         else if (cmd.startsWith("PWM ")) {
-            if (currentState == AWAITING_TARGET) {
-                Serial.println(">>> REJECTED: You must set a TARGET voltage first.");
+            if (currentState == AWAITING_LOAD || currentState == AWAITING_TARGET) {
+                Serial.println(">>> REJECTED: Setup LOAD and TARGET first.");
                 return;
             }
             int val = cmd.substring(4).toInt();
