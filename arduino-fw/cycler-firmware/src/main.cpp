@@ -1,5 +1,5 @@
 /**
- * PUDELstat Firmware - Load-Aware State Machine
+ * PUDELstat Firmware - Load-Aware State Machine (Bidirectional Target)
  * Features: Chemistry Guardrails, Auto-Zero, Moving Avg, Hardware Latch
  */
 
@@ -16,7 +16,8 @@ float CURRENT_ZERO_ADC = 512.0;
 const float ADC_CURR_GAIN_MA = 0.0718; 
 const float ADC_VOLT_GAIN = (5.00 / 1023.0);
 
-enum SystemState { AWAITING_LOAD, AWAITING_TARGET, IDLE, RUNNING, ERROR, CHARGE_COMPLETE };
+// Renamed CHARGE_COMPLETE to TARGET_REACHED to reflect bidirectional capability
+enum SystemState { AWAITING_LOAD, AWAITING_TARGET, IDLE, RUNNING, ERROR, TARGET_REACHED };
 SystemState currentState = AWAITING_LOAD;
 
 String currentLoadName = "NONE";
@@ -97,23 +98,27 @@ void loop() {
     float c = ((sumCurr / 20.0) - CURRENT_ZERO_ADC) * ADC_CURR_GAIN_MA;
     float true_cap_voltage = absolute_ce - absolute_we;
     
-    // 3. GRACEFUL SOFTWARE CUTOFFS
+    // 3. GRACEFUL SOFTWARE CUTOFFS (Bidirectional)
     if (currentState == RUNNING) {
-        // CHARGE CUTOFF: Current flowing IN (PWM < 127)
-        if (currentPWMCommand < 127 && true_cap_voltage >= targetVoltage) {
-            setPWMDuty(127);
-            currentPWMCommand = 127;
-            currentState = CHARGE_COMPLETE;
-            Serial.println("\n>>> GRACEFUL STOP: Target Charge Voltage Reached! <<<");
-            Serial.println(">>> Current Halted. System CHARGE_COMPLETE.\n");
+        // CHARGING: Voltage is rising (PWM < 127)
+        if (currentPWMCommand < 127) {
+            if (true_cap_voltage >= targetVoltage || true_cap_voltage >= maxAllowableCeiling) {
+                setPWMDuty(127);
+                currentPWMCommand = 127;
+                currentState = TARGET_REACHED;
+                Serial.println("\n>>> GRACEFUL STOP: Upper Target Reached! <<<");
+                Serial.println(">>> Current Halted. Set new TARGET to continue.\n");
+            }
         }
-        // DISCHARGE CUTOFF: Current flowing OUT (PWM > 127)
-        else if (currentPWMCommand > 127 && true_cap_voltage <= safeFloorVoltage) {
-            setPWMDuty(127);
-            currentPWMCommand = 127;
-            currentState = IDLE;
-            Serial.println("\n>>> GRACEFUL STOP: Safe Discharge Floor Reached! <<<");
-            Serial.println(">>> Current Halted. System IDLE.\n");
+        // DISCHARGING: Voltage is falling (PWM > 127)
+        else if (currentPWMCommand > 127) {
+            if (true_cap_voltage <= targetVoltage || true_cap_voltage <= safeFloorVoltage) {
+                setPWMDuty(127);
+                currentPWMCommand = 127;
+                currentState = TARGET_REACHED;
+                Serial.println("\n>>> GRACEFUL STOP: Lower Target Reached! <<<");
+                Serial.println(">>> Current Halted. Set new TARGET to continue.\n");
+            }
         }
     }
     
@@ -128,7 +133,7 @@ void loop() {
             if (currentState == AWAITING_LOAD) Serial.print("WAIT_LOAD | ");
             else if (currentState == AWAITING_TARGET) Serial.print("WAIT_TGT | ");
             else if (currentState == IDLE) Serial.print("IDLE | ");
-            else if (currentState == CHARGE_COMPLETE) Serial.print("DONE | ");
+            else if (currentState == TARGET_REACHED) Serial.print("DONE | ");
             else if (currentState == RUNNING && currentPWMCommand < 127) Serial.print("CHARGING | ");
             else if (currentState == RUNNING && currentPWMCommand > 127) Serial.print("DISCHARGING | ");
             else Serial.print("RUNNING | ");
@@ -194,7 +199,7 @@ void handleSerialCommands() {
             Serial.print("\n>>> LOAD SET: "); Serial.println(currentLoadName);
             Serial.print(">>> Guardrails Locked -> Floor: "); Serial.print(safeFloorVoltage, 2);
             Serial.print("V, Ceiling: "); Serial.print(maxAllowableCeiling, 2); Serial.println("V");
-            Serial.println(">>> Send 'TARGET <volts>' to set your charge limit.\n");
+            Serial.println(">>> Send 'TARGET <volts>' to set your destination.\n");
         }
         else if (cmd.startsWith("TARGET ")) {
             if (currentState == AWAITING_LOAD) {
@@ -205,7 +210,7 @@ void handleSerialCommands() {
             if (requestedTarget >= safeFloorVoltage && requestedTarget <= maxAllowableCeiling) {
                 targetVoltage = requestedTarget;
                 currentState = IDLE;
-                Serial.print("\n>>> UPPER TARGET SET: "); 
+                Serial.print("\n>>> TARGET SET: "); 
                 Serial.print(targetVoltage, 2); 
                 Serial.println("V");
                 Serial.println(">>> Send 'PWM <0-126>' to Charge. Send 'PWM <128-255>' to Discharge.\n");
