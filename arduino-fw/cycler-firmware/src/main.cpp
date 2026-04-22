@@ -1,6 +1,6 @@
 /**
- * PUDELstat Firmware - Load-Aware State Machine (Bidirectional Target)
- * Features: Chemistry Guardrails, Auto-Zero, Moving Avg, Hardware Latch
+ * PUDELstat Firmware - Dynamic Virtual Ground Tracking
+ * Features: Chemistry Guardrails, A3 Differential Current, Hardware Latch
  */
 
 #include <Arduino.h>
@@ -8,15 +8,15 @@
 const int PIN_PWM_OUT = 9;      
 const int PIN_VOLT_SENSE = A0;  
 const int PIN_CURR_SENSE = A2;  
+const int PIN_VIRT_GND_SENSE = A3; // NEW: Pin 6 Tracking
 const int PIN_DIVIDER_EN = 6;   
 const int PIN_RELAY_DRIVE = 3;     
 const int PIN_FAULT_INTERRUPT = 2; 
 
-float CURRENT_ZERO_ADC = 512.0; 
+float ZERO_OFFSET_ADC = 0.0; 
 const float ADC_CURR_GAIN_MA = 0.0718; 
 const float ADC_VOLT_GAIN = (5.00 / 1023.0);
 
-// Renamed CHARGE_COMPLETE to TARGET_REACHED to reflect bidirectional capability
 enum SystemState { AWAITING_LOAD, AWAITING_TARGET, IDLE, RUNNING, ERROR, TARGET_REACHED };
 SystemState currentState = AWAITING_LOAD;
 
@@ -56,19 +56,20 @@ void setup() {
     Serial.println("SYSTEM BOOT: Allowing analog hardware to settle...");
     delay(1000); 
     
-    Serial.println("SYSTEM BOOT: Calibrating Zero Point...");
-    long sumA2 = 0;
+    // NEW DIFFERENTIAL AUTO-ZERO
+    Serial.println("SYSTEM BOOT: Calibrating Differential Zero Point...");
+    long sumOffset = 0;
     for(int i = 0; i < 100; i++) {
-        sumA2 += analogRead(PIN_CURR_SENSE);
+        sumOffset += (analogRead(PIN_CURR_SENSE) - analogRead(PIN_VIRT_GND_SENSE));
         delay(5);
     }
-    CURRENT_ZERO_ADC = (float)sumA2 / 100.0;
+    ZERO_OFFSET_ADC = (float)sumOffset / 100.0;
     
     EIFR = bit(INTF0); 
     attachInterrupt(digitalPinToInterrupt(PIN_FAULT_INTERRUPT), hardwareFaultISR, FALLING);
     
-    Serial.print("CALIBRATION COMPLETE. True Zero ADC: ");
-    Serial.println(CURRENT_ZERO_ADC, 2);
+    Serial.print("CALIBRATION COMPLETE. Base Offset ADC: ");
+    Serial.println(ZERO_OFFSET_ADC, 2);
     Serial.println("\n>>> SYSTEM LOCKED. Select Load Type First.");
     Serial.println(">>> Send 'LOAD SUPERCAP', 'LOAD NIMH', 'LOAD RESISTOR', or 'LOAD CUSTOM'.");
 }
@@ -87,20 +88,28 @@ void loop() {
     // 2. TELEMETRY & FILTERING
     long sumVolt = 0;
     long sumCurr = 0;
+    long sumVirtGnd = 0;
     for(int i = 0; i < 20; i++) {
         sumVolt += analogRead(PIN_VOLT_SENSE);
         sumCurr += analogRead(PIN_CURR_SENSE);
+        sumVirtGnd += analogRead(PIN_VIRT_GND_SENSE); // NEW
         delay(2); 
     }
     
-    float absolute_ce = (sumVolt / 20.0) * ADC_VOLT_GAIN;
-    float absolute_we = (sumCurr / 20.0) * ADC_VOLT_GAIN;
-    float c = ((sumCurr / 20.0) - CURRENT_ZERO_ADC) * ADC_CURR_GAIN_MA;
+    float avgVoltADC = sumVolt / 20.0;
+    float avgCurrADC = sumCurr / 20.0;
+    float avgVirtGndADC = sumVirtGnd / 20.0;
+
+    float absolute_ce = avgVoltADC * ADC_VOLT_GAIN;
+    float absolute_we = avgCurrADC * ADC_VOLT_GAIN;
     float true_cap_voltage = absolute_ce - absolute_we;
+    
+    // NEW DIFFERENTIAL CURRENT CALCULATION
+    float rawDiffADC = avgCurrADC - avgVirtGndADC;
+    float c = (rawDiffADC - ZERO_OFFSET_ADC) * ADC_CURR_GAIN_MA;
     
     // 3. GRACEFUL SOFTWARE CUTOFFS (Bidirectional)
     if (currentState == RUNNING) {
-        // CHARGING: Voltage is rising (PWM < 127)
         if (currentPWMCommand < 127) {
             if (true_cap_voltage >= targetVoltage || true_cap_voltage >= maxAllowableCeiling) {
                 setPWMDuty(127);
@@ -110,7 +119,6 @@ void loop() {
                 Serial.println(">>> Current Halted. Set new TARGET to continue.\n");
             }
         }
-        // DISCHARGING: Voltage is falling (PWM > 127)
         else if (currentPWMCommand > 127) {
             if (true_cap_voltage <= targetVoltage || true_cap_voltage <= safeFloorVoltage) {
                 setPWMDuty(127);
