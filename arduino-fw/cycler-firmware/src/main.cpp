@@ -1,6 +1,6 @@
 /**
- * PUDELstat Firmware - Empirically Calibrated
- * Features: A3 Differential Current, Chemistry Guardrails, HW Latch
+ * PUDELstat Firmware - Coulomb Counting Edition
+ * Features: A3 Diff Current, HW Latch, Dual-Direction Capacity Integration
  * Calibrated Zero: PWM 130 | Calibrated Gain: 0.0730
  */
 
@@ -15,7 +15,7 @@ const int PIN_RELAY_DRIVE = 3;
 const int PIN_FAULT_INTERRUPT = 2; 
 
 float ZERO_OFFSET_ADC = 0.0; 
-const float ADC_CURR_GAIN_MA = 0.0730; // EMPIRICALLY CALIBRATED
+const float ADC_CURR_GAIN_MA = 0.0730; 
 const float ADC_VOLT_GAIN = (5.00 / 1023.0);
 
 enum SystemState { AWAITING_LOAD, AWAITING_TARGET, IDLE, RUNNING, ERROR, TARGET_REACHED };
@@ -25,7 +25,12 @@ String currentLoadName = "NONE";
 float maxAllowableCeiling = 0.0;
 float safeFloorVoltage = 0.0;
 float targetVoltage = 0.0;
-uint8_t currentPWMCommand = 130; // HARDWARE ZERO
+uint8_t currentPWMCommand = 130; 
+
+// --- COULOMB COUNTING VARIABLES ---
+float totalCharge_mAh = 0.0;
+float totalDischarge_mAh = 0.0;
+unsigned long lastIntegrationTime = 0;
 
 volatile bool hardwareFaultDetected = false;
 unsigned long lastTelemetryTime = 0;
@@ -105,6 +110,20 @@ void loop() {
     float rawDiffADC = avgCurrADC - avgVirtGndADC;
     float c = (rawDiffADC - ZERO_OFFSET_ADC) * ADC_CURR_GAIN_MA;
     
+    // --- COULOMB COUNTING INTEGRATION ---
+    unsigned long currentTime = millis();
+    if (currentState == RUNNING) {
+        unsigned long deltaT_ms = currentTime - lastIntegrationTime;
+        float hoursElapsed = deltaT_ms / 3600000.0;
+        
+        if (currentPWMCommand < 130) {
+            totalCharge_mAh += (c * hoursElapsed); // Current is positive
+        } else if (currentPWMCommand > 130) {
+            totalDischarge_mAh += (abs(c) * hoursElapsed); // Current is negative
+        }
+    }
+    lastIntegrationTime = currentTime;
+    
     if (currentState == RUNNING) {
         if (currentPWMCommand < 130) {
             if (true_cap_voltage >= targetVoltage || true_cap_voltage >= maxAllowableCeiling) {
@@ -143,7 +162,16 @@ void loop() {
             
             Serial.print("Target: "); Serial.print(targetVoltage, 2); Serial.print("V | ");
             Serial.print("Cell: "); Serial.print(true_cap_voltage, 3); Serial.print("V | ");
-            Serial.print("Current: "); Serial.print(c, 3); Serial.print("mA");
+            Serial.print("Current: "); Serial.print(c, 3); Serial.print("mA | ");
+            
+            // Output Capacity based on current action
+            if (currentPWMCommand < 130 || currentState == TARGET_REACHED) {
+                Serial.print("Chg: "); Serial.print(totalCharge_mAh, 4); Serial.print("mAh");
+            } 
+            if (currentPWMCommand > 130 || currentState == TARGET_REACHED) {
+                if (currentPWMCommand < 130 || currentState == TARGET_REACHED) Serial.print(" | "); // separator
+                Serial.print("Dschg: "); Serial.print(totalDischarge_mAh, 4); Serial.print("mAh");
+            }
         }
         Serial.println();
         lastTelemetryTime = millis();
@@ -213,6 +241,11 @@ void handleSerialCommands() {
             if (requestedTarget >= safeFloorVoltage && requestedTarget <= maxAllowableCeiling) {
                 targetVoltage = requestedTarget;
                 currentState = IDLE;
+                
+                // Reset capacity counters when a new cycle target is set
+                totalCharge_mAh = 0.0;
+                totalDischarge_mAh = 0.0;
+                
                 Serial.print("\n>>> TARGET SET: "); 
                 Serial.print(targetVoltage, 2); 
                 Serial.println("V");
@@ -233,6 +266,7 @@ void handleSerialCommands() {
                 currentPWMCommand = val;
                 setPWMDuty(val);
                 currentState = RUNNING;
+                lastIntegrationTime = millis(); // Reset timer right as current begins
                 Serial.print(">>> COMMAND ACCEPTED: PWM = ");
                 Serial.println(val);
             } else {
