@@ -145,35 +145,30 @@ void loop() {
         }
     }
     
+    // 4. PRINT TELEMETRY (Machine-Readable CSV Format)
     if (millis() - lastTelemetryTime >= 250) {
         if (currentState == ERROR) {
-            Serial.print(absolute_ce, 3); Serial.print("V (CE), ");
-            Serial.print(absolute_we, 3); Serial.print("V (WE), LOCKED_ERROR");
+            Serial.print("ERROR,");
+            Serial.print(absolute_ce, 3); Serial.print(",");
+            Serial.println(absolute_we, 3);
         } else {
-            Serial.print("Load: "); Serial.print(currentLoadName); Serial.print(" | State: "); 
+            Serial.print("DATA,"); // Prefix to tell Python this is valid telemetry
             
-            if (currentState == AWAITING_LOAD) Serial.print("WAIT_LOAD | ");
-            else if (currentState == AWAITING_TARGET) Serial.print("WAIT_TGT | ");
-            else if (currentState == IDLE) Serial.print("IDLE | ");
-            else if (currentState == TARGET_REACHED) Serial.print("DONE | ");
-            else if (currentState == RUNNING && currentPWMCommand < 130) Serial.print("CHARGING | ");
-            else if (currentState == RUNNING && currentPWMCommand > 130) Serial.print("DISCHARGING | ");
-            else Serial.print("RUNNING | ");
+            if (currentState == AWAITING_LOAD) Serial.print("WAIT_LOAD,");
+            else if (currentState == AWAITING_TARGET) Serial.print("WAIT_TGT,");
+            else if (currentState == IDLE) Serial.print("IDLE,");
+            else if (currentState == TARGET_REACHED) Serial.print("DONE,");
+            else if (currentState == RUNNING && currentPWMCommand < 130) Serial.print("CHARGING,");
+            else if (currentState == RUNNING && currentPWMCommand > 130) Serial.print("DISCHARGING,");
+            else Serial.print("RUNNING,");
             
-            Serial.print("Target: "); Serial.print(targetVoltage, 2); Serial.print("V | ");
-            Serial.print("Cell: "); Serial.print(true_cap_voltage, 3); Serial.print("V | ");
-            Serial.print("Current: "); Serial.print(c, 3); Serial.print("mA | ");
-            
-            // Output Capacity based on current action
-            if (currentPWMCommand < 130 || currentState == TARGET_REACHED) {
-                Serial.print("Chg: "); Serial.print(totalCharge_mAh, 4); Serial.print("mAh");
-            } 
-            if (currentPWMCommand > 130 || currentState == TARGET_REACHED) {
-                if (currentPWMCommand < 130 || currentState == TARGET_REACHED) Serial.print(" | "); // separator
-                Serial.print("Dschg: "); Serial.print(totalDischarge_mAh, 4); Serial.print("mAh");
-            }
+            Serial.print(currentLoadName); Serial.print(",");
+            Serial.print(targetVoltage, 2); Serial.print(",");
+            Serial.print(true_cap_voltage, 3); Serial.print(",");
+            Serial.print(c, 3); Serial.print(",");
+            Serial.print(totalCharge_mAh, 4); Serial.print(",");
+            Serial.println(totalDischarge_mAh, 4);
         }
-        Serial.println();
         lastTelemetryTime = millis();
     }
     
