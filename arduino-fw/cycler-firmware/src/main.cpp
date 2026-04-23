@@ -1,6 +1,7 @@
 /**
- * PUDELstat Firmware - Dynamic Virtual Ground Tracking
- * Features: Chemistry Guardrails, A3 Differential Current, Hardware Latch
+ * PUDELstat Firmware - Empirically Calibrated
+ * Features: A3 Differential Current, Chemistry Guardrails, HW Latch
+ * Calibrated Zero: PWM 130 | Calibrated Gain: 0.0730
  */
 
 #include <Arduino.h>
@@ -8,13 +9,13 @@
 const int PIN_PWM_OUT = 9;      
 const int PIN_VOLT_SENSE = A0;  
 const int PIN_CURR_SENSE = A2;  
-const int PIN_VIRT_GND_SENSE = A3; // NEW: Pin 6 Tracking
+const int PIN_VIRT_GND_SENSE = A3; 
 const int PIN_DIVIDER_EN = 6;   
 const int PIN_RELAY_DRIVE = 3;     
 const int PIN_FAULT_INTERRUPT = 2; 
 
 float ZERO_OFFSET_ADC = 0.0; 
-const float ADC_CURR_GAIN_MA = 0.0718; 
+const float ADC_CURR_GAIN_MA = 0.0730; // EMPIRICALLY CALIBRATED
 const float ADC_VOLT_GAIN = (5.00 / 1023.0);
 
 enum SystemState { AWAITING_LOAD, AWAITING_TARGET, IDLE, RUNNING, ERROR, TARGET_REACHED };
@@ -24,13 +25,13 @@ String currentLoadName = "NONE";
 float maxAllowableCeiling = 0.0;
 float safeFloorVoltage = 0.0;
 float targetVoltage = 0.0;
-uint8_t currentPWMCommand = 127;
+uint8_t currentPWMCommand = 130; // HARDWARE ZERO
 
 volatile bool hardwareFaultDetected = false;
 unsigned long lastTelemetryTime = 0;
 
 void hardwareFaultISR() {
-    OCR1A = 127; 
+    OCR1A = 130; 
     hardwareFaultDetected = true;
 }
 
@@ -51,12 +52,11 @@ void setup() {
     digitalWrite(PIN_DIVIDER_EN, HIGH); 
     
     setupTimer1_31kHz();
-    setPWMDuty(127); 
+    setPWMDuty(130); 
     
     Serial.println("SYSTEM BOOT: Allowing analog hardware to settle...");
     delay(1000); 
     
-    // NEW DIFFERENTIAL AUTO-ZERO
     Serial.println("SYSTEM BOOT: Calibrating Differential Zero Point...");
     long sumOffset = 0;
     for(int i = 0; i < 100; i++) {
@@ -75,24 +75,22 @@ void setup() {
 }
 
 void loop() {
-    // 1. HARDWARE LATCH CHECK
     if (hardwareFaultDetected && currentState != ERROR) {
         currentState = ERROR;
         Serial.println("\n==================================================");
         Serial.println(">>> CRITICAL ALARM: HARDWARE FAULT TRIPPED <<<");
-        Serial.println(">>> RELAY OPENED. PWM LATCHED TO 127 (0mA). <<<");
+        Serial.println(">>> RELAY OPENED. PWM LATCHED TO 130 (0mA). <<<");
         Serial.println(">>> SYSTEM LOCKED. PRESS RESET BUTTON TO CLEAR. <<<");
         Serial.println("==================================================\n");
     }
 
-    // 2. TELEMETRY & FILTERING
     long sumVolt = 0;
     long sumCurr = 0;
     long sumVirtGnd = 0;
     for(int i = 0; i < 20; i++) {
         sumVolt += analogRead(PIN_VOLT_SENSE);
         sumCurr += analogRead(PIN_CURR_SENSE);
-        sumVirtGnd += analogRead(PIN_VIRT_GND_SENSE); // NEW
+        sumVirtGnd += analogRead(PIN_VIRT_GND_SENSE); 
         delay(2); 
     }
     
@@ -104,25 +102,23 @@ void loop() {
     float absolute_we = avgCurrADC * ADC_VOLT_GAIN;
     float true_cap_voltage = absolute_ce - absolute_we;
     
-    // NEW DIFFERENTIAL CURRENT CALCULATION
     float rawDiffADC = avgCurrADC - avgVirtGndADC;
     float c = (rawDiffADC - ZERO_OFFSET_ADC) * ADC_CURR_GAIN_MA;
     
-    // 3. GRACEFUL SOFTWARE CUTOFFS (Bidirectional)
     if (currentState == RUNNING) {
-        if (currentPWMCommand < 127) {
+        if (currentPWMCommand < 130) {
             if (true_cap_voltage >= targetVoltage || true_cap_voltage >= maxAllowableCeiling) {
-                setPWMDuty(127);
-                currentPWMCommand = 127;
+                setPWMDuty(130);
+                currentPWMCommand = 130;
                 currentState = TARGET_REACHED;
                 Serial.println("\n>>> GRACEFUL STOP: Upper Target Reached! <<<");
                 Serial.println(">>> Current Halted. Set new TARGET to continue.\n");
             }
         }
-        else if (currentPWMCommand > 127) {
+        else if (currentPWMCommand > 130) {
             if (true_cap_voltage <= targetVoltage || true_cap_voltage <= safeFloorVoltage) {
-                setPWMDuty(127);
-                currentPWMCommand = 127;
+                setPWMDuty(130);
+                currentPWMCommand = 130;
                 currentState = TARGET_REACHED;
                 Serial.println("\n>>> GRACEFUL STOP: Lower Target Reached! <<<");
                 Serial.println(">>> Current Halted. Set new TARGET to continue.\n");
@@ -130,7 +126,6 @@ void loop() {
         }
     }
     
-    // 4. PRINT TELEMETRY
     if (millis() - lastTelemetryTime >= 250) {
         if (currentState == ERROR) {
             Serial.print(absolute_ce, 3); Serial.print("V (CE), ");
@@ -142,8 +137,8 @@ void loop() {
             else if (currentState == AWAITING_TARGET) Serial.print("WAIT_TGT | ");
             else if (currentState == IDLE) Serial.print("IDLE | ");
             else if (currentState == TARGET_REACHED) Serial.print("DONE | ");
-            else if (currentState == RUNNING && currentPWMCommand < 127) Serial.print("CHARGING | ");
-            else if (currentState == RUNNING && currentPWMCommand > 127) Serial.print("DISCHARGING | ");
+            else if (currentState == RUNNING && currentPWMCommand < 130) Serial.print("CHARGING | ");
+            else if (currentState == RUNNING && currentPWMCommand > 130) Serial.print("DISCHARGING | ");
             else Serial.print("RUNNING | ");
             
             Serial.print("Target: "); Serial.print(targetVoltage, 2); Serial.print("V | ");
@@ -202,8 +197,8 @@ void handleSerialCommands() {
             }
             
             currentState = AWAITING_TARGET;
-            setPWMDuty(127); 
-            currentPWMCommand = 127;
+            setPWMDuty(130); 
+            currentPWMCommand = 130;
             Serial.print("\n>>> LOAD SET: "); Serial.println(currentLoadName);
             Serial.print(">>> Guardrails Locked -> Floor: "); Serial.print(safeFloorVoltage, 2);
             Serial.print("V, Ceiling: "); Serial.print(maxAllowableCeiling, 2); Serial.println("V");
@@ -221,7 +216,7 @@ void handleSerialCommands() {
                 Serial.print("\n>>> TARGET SET: "); 
                 Serial.print(targetVoltage, 2); 
                 Serial.println("V");
-                Serial.println(">>> Send 'PWM <0-126>' to Charge. Send 'PWM <128-255>' to Discharge.\n");
+                Serial.println(">>> Send 'PWM <0-129>' to Charge. Send 'PWM <131-255>' to Discharge.\n");
             } else {
                 Serial.print(">>> ERROR: Target must be between ");
                 Serial.print(safeFloorVoltage, 2); Serial.print("V and ");
