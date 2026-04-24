@@ -61,8 +61,6 @@ class SerialWorker(QtCore.QThread):
             start_time = time.time()
 
             while self.is_running:
-                # Process outgoing commands with a deliberate 50ms delay 
-                # to prevent serial buffer overrun on the frozen Arduino
                 while not self.command_queue.empty():
                     cmd = self.command_queue.get()
                     ser.write(f"{cmd}\n".encode('utf-8'))
@@ -132,6 +130,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.last_charge_cap = 0.0
         
         self.latest_v_cell = 0.0
+        self.pre_pwm = 130 # Cache for pre-conditioning direction
 
         os.makedirs("test-data", exist_ok=True)
         os.makedirs("cycle-data", exist_ok=True)
@@ -331,9 +330,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def update_spinbox_limits(self, load_type):
         limits = LOAD_LIMITS[load_type]
-        self.target_input.setRange(limits["floor"], limits["ceil"])
-        self.chg_v.setRange(limits["floor"], limits["ceil"])
-        self.dchg_v.setRange(limits["floor"], limits["ceil"])
+        safe_floor = limits["floor"] + 0.02
+        safe_ceil = limits["ceil"] - 0.02
+        
+        self.target_input.setRange(safe_floor, safe_ceil)
+        self.chg_v.setRange(safe_floor, safe_ceil)
+        self.dchg_v.setRange(safe_floor, safe_ceil)
 
     def log_orchestrator(self, msg):
         self.orchestrator_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
@@ -374,6 +376,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tabs.setTabEnabled(1, False)
 
     def start_auto_test(self):
+        # Mathematical Interlock: PEBKAC Safety Check
+        if self.chg_v.value() <= self.dchg_v.value():
+            QMessageBox.critical(self, "Mathematical Logic Error", "Charge Target must be strictly greater than Discharge Target to cycle safely.")
+            return
+
         dut_serial = self.validate_serial()
         if not dut_serial: return
 
@@ -393,7 +400,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.worker.send_command(f"LOAD {load_type}")
         self.auto_mode_active = True
         
-        # Explicit Acknowledgement State to prevent dropped pre-conditioning commands
         self.sm_state = "WAIT_FOR_LOAD_ACK"
         self.sm_cycles_total = self.cycles_n.value()
         self.sm_cycles_done = 0
@@ -430,21 +436,12 @@ class MainWindow(QtWidgets.QMainWindow):
             return
             
         target_v = self.target_input.value()
-        load_type = self.load_dropdown.currentText()
-        limits = LOAD_LIMITS[load_type]
-
-        if target_v > limits["ceil"] or target_v < limits["floor"]:
-            QMessageBox.critical(self, "Limit Exceeded", f"Voltage out of bounds for {load_type}!")
-            return
-
         self.vi_v_data.clear()
         self.vi_i_data.clear()
         self.line_vi.setData([], [])
         
-        # New Feature: Safely halt hardware whenever target changes to prevent runaway states
         self.pwm_input.setValue(130)
         self.worker.send_command("PWM 130")
-        
         self.worker.send_command(f"TARGET {target_v:.2f}")
 
     def send_pwm_command(self):
@@ -494,45 +491,77 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # --- SYSTEM INITIALIZATION ---
         if self.sm_state == "WAIT_FOR_LOAD_ACK":
-            if data['load_type'] == self.load_dropdown.currentText():
-                self.sm_state = "START_PRE_DISCHARGE"
+            if data['load_type'] == self.load_dropdown.currentText() and hw_state == "WAIT_TGT":
+                self.sm_state = "START_PRE_CONDITIONING"
 
         # --- PRE-CONDITIONING SEQUENCE ---
-        elif self.sm_state == "START_PRE_DISCHARGE":
-            floor_v = LOAD_LIMITS[self.load_dropdown.currentText()]["floor"]
-            # Added a 50mV hysteresis to prevent infinite hang on noisy ADC readings
-            if data['cell_v'] <= (floor_v + 0.05):
+        elif self.sm_state == "START_PRE_CONDITIONING":
+            self.pre_target = self.dchg_v.value()
+            self.worker.send_command("PWM 130") # Safely halt hardware
+            
+            # Determine if we need to pre-charge or pre-discharge to hit baseline
+            if data['cell_v'] < (self.pre_target - 0.05):
+                self.pre_pwm = self.chg_pwm.value()
+                action_text = "Charging"
+            elif data['cell_v'] > (self.pre_target + 0.05):
+                self.pre_pwm = self.dchg_pwm.value()
+                action_text = "Discharging"
+            else:
                 self.log_orchestrator(f"Cell already at baseline ({data['cell_v']:.3f}V). Skipping pre-conditioning.")
                 self.sm_state = "START_CHARGE"
-            else:
-                self.worker.send_command(f"TARGET {floor_v:.2f}")
-                self.worker.send_command(f"PWM {self.dchg_pwm.value()}")
-                self.log_orchestrator(f"Pre-conditioning: Discharging to baseline floor ({floor_v:.2f}V)...")
-                self.sm_state = "WAIT_PRE_DISCHARGE_ACK"
+                return
+
+            self.worker.send_command(f"TARGET {self.pre_target:.2f}")
+            self.worker.send_command(f"PWM {self.pre_pwm}")
             
-        elif self.sm_state == "WAIT_PRE_DISCHARGE_ACK":
-            if hw_state != "DONE":
-                self.sm_state = "WAIT_PRE_DISCHARGE_DONE"
+            self.log_orchestrator(f"Pre-conditioning: {action_text} to baseline ({self.pre_target:.2f}V)...")
+            self.sm_timer_start = time.time()
+            self.sm_state = "WAIT_PRE_COND_ACK"
+            
+        elif self.sm_state == "WAIT_PRE_COND_ACK":
+            if abs(data['target_v'] - self.pre_target) < 0.05:
+                self.sm_state = "WAIT_PRE_COND_DONE"
+            elif time.time() - self.sm_timer_start > 3.0: 
+                self.log_orchestrator("Command dropped. Retrying pre-conditioning commands...")
+                self.worker.send_command("PWM 130")
+                self.worker.send_command(f"TARGET {self.pre_target:.2f}")
+                self.worker.send_command(f"PWM {self.pre_pwm}")
+                self.sm_timer_start = time.time()
                 
-        elif self.sm_state == "WAIT_PRE_DISCHARGE_DONE":
+        elif self.sm_state == "WAIT_PRE_COND_DONE":
             if hw_state == "DONE":
                 self.worker.send_command("PWM 130") 
-                self.log_orchestrator("Baseline reached. Pre-conditioning complete.")
-                self.sm_state = "START_CHARGE" 
+                self.log_orchestrator(f"Baseline reached. Resting for {self.sm_rest_duration}s before Cycle 1...")
+                self.sm_timer_start = time.time()
+                self.sm_state = "REST_POST_PRE_COND"
+                
+        elif self.sm_state == "REST_POST_PRE_COND":
+            if time.time() - self.sm_timer_start >= self.sm_rest_duration:
+                self.sm_state = "START_CHARGE"
 
         # --- STANDARD CYCLING SEQUENCE ---
         elif self.sm_state == "START_CHARGE":
             self.vi_v_data.clear()
             self.vi_i_data.clear()
             self.line_vi.setData([], [])
-            self.worker.send_command(f"TARGET {self.chg_v.value():.2f}")
+            self.chg_target_cache = self.chg_v.value()
+            
+            self.worker.send_command("PWM 130")
+            self.worker.send_command(f"TARGET {self.chg_target_cache:.2f}")
             self.worker.send_command(f"PWM {self.chg_pwm.value()}")
+            
             self.log_orchestrator(f"Cycle {self.sm_cycles_done + 1}/{self.sm_cycles_total}: Charging...")
+            self.sm_timer_start = time.time()
             self.sm_state = "WAIT_CHARGE_ACK"
 
         elif self.sm_state == "WAIT_CHARGE_ACK":
-            if hw_state != "DONE":
+            if abs(data['target_v'] - self.chg_target_cache) < 0.05:
                 self.sm_state = "WAIT_CHARGE_DONE"
+            elif time.time() - self.sm_timer_start > 3.0: 
+                self.worker.send_command("PWM 130")
+                self.worker.send_command(f"TARGET {self.chg_target_cache:.2f}")
+                self.worker.send_command(f"PWM {self.chg_pwm.value()}")
+                self.sm_timer_start = time.time()
 
         elif self.sm_state == "WAIT_CHARGE_DONE":
             if hw_state == "DONE":
@@ -550,14 +579,24 @@ class MainWindow(QtWidgets.QMainWindow):
             self.vi_v_data.clear()
             self.vi_i_data.clear()
             self.line_vi.setData([], [])
-            self.worker.send_command(f"TARGET {self.dchg_v.value():.2f}")
+            self.dchg_target_cache = self.dchg_v.value()
+            
+            self.worker.send_command("PWM 130")
+            self.worker.send_command(f"TARGET {self.dchg_target_cache:.2f}")
             self.worker.send_command(f"PWM {self.dchg_pwm.value()}")
+            
             self.log_orchestrator(f"Cycle {self.sm_cycles_done + 1}/{self.sm_cycles_total}: Discharging...")
+            self.sm_timer_start = time.time()
             self.sm_state = "WAIT_DISCHARGE_ACK"
 
         elif self.sm_state == "WAIT_DISCHARGE_ACK":
-            if hw_state != "DONE":
+            if abs(data['target_v'] - self.dchg_target_cache) < 0.05:
                 self.sm_state = "WAIT_DISCHARGE_DONE"
+            elif time.time() - self.sm_timer_start > 3.0: 
+                self.worker.send_command("PWM 130")
+                self.worker.send_command(f"TARGET {self.dchg_target_cache:.2f}")
+                self.worker.send_command(f"PWM {self.dchg_pwm.value()}")
+                self.sm_timer_start = time.time()
 
         elif self.sm_state == "WAIT_DISCHARGE_DONE":
             if hw_state == "DONE":
