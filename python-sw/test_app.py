@@ -40,17 +40,12 @@ class SerialWorker(QtCore.QThread):
 
     def run(self):
         try:
-            # Timeout is critical: allows checking the command queue even if no data is received
             ser = serial.Serial(self.port, self.baudrate, timeout=0.1)
             
-            # --- THE FIX: BOOTLOADER DELAY ---
-            # Wait 2.0 seconds for the Arduino to finish its hardware reset
+            # Bootloader Delay: Wait 2.0s for hardware reset, flush buffers
             time.sleep(2.0)
-            
-            # Flush any corrupted initialization bytes from the I/O buffers
             ser.reset_input_buffer() 
             ser.reset_output_buffer()
-            # ---------------------------------
             
         except Exception as e:
             print(f"Failed to connect to {self.port}: {e}")
@@ -69,13 +64,11 @@ class SerialWorker(QtCore.QThread):
             start_time = time.time()
 
             while self.is_running:
-                # 1. Write any pending commands to Serial
                 while not self.command_queue.empty():
                     cmd = self.command_queue.get()
                     ser.write(f"{cmd}\n".encode('utf-8'))
                     print(f"Sent: {cmd}")
 
-                # 2. Read incoming data
                 try:
                     line = ser.readline().decode('utf-8').strip()
                     if line.startswith("DATA,"):
@@ -103,7 +96,7 @@ class SerialWorker(QtCore.QThread):
                                 "charge_mah": charge_mah,
                                 "discharge_mah": discharge_mah
                             })
-                except Exception as e:
+                except Exception:
                     pass # Silently drop parse errors caused by noise
 
         ser.close()
@@ -186,6 +179,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.line_i = self.plot_i.plot(pen=pg.mkPen('c', width=2))
         main_layout.addWidget(self.plot_i)
 
+        # Connect dropdown to dynamically update input limits, then initialize it
+        self.load_dropdown.currentTextChanged.connect(self.update_spinbox_limits)
+        self.update_spinbox_limits(self.load_dropdown.currentText())
+
     def setup_manual_tab(self):
         layout = QtWidgets.QVBoxLayout(self.tab_manual)
         
@@ -198,7 +195,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
         ctrl_layout = QtWidgets.QHBoxLayout()
         self.target_input = QtWidgets.QDoubleSpinBox()
-        self.target_input.setRange(-5.0, 10.0)
         self.target_input.setSingleStep(0.1)
         self.btn_target = QtWidgets.QPushButton("Set TARGET")
         self.btn_target.clicked.connect(self.send_target_command)
@@ -225,17 +221,13 @@ class MainWindow(QtWidgets.QMainWindow):
         param_layout = QtWidgets.QGridLayout()
         
         self.chg_v = QtWidgets.QDoubleSpinBox()
-        self.chg_v.setRange(0, 10.0)
         self.chg_v.setSingleStep(0.1)
-        self.chg_v.setValue(2.3)
         self.chg_pwm = QtWidgets.QSpinBox()
         self.chg_pwm.setRange(0, 129)
         self.chg_pwm.setValue(80)
         
         self.dchg_v = QtWidgets.QDoubleSpinBox()
-        self.dchg_v.setRange(0, 10.0)
         self.dchg_v.setSingleStep(0.1)
-        self.dchg_v.setValue(0.1)
         self.dchg_pwm = QtWidgets.QSpinBox()
         self.dchg_pwm.setRange(131, 255)
         self.dchg_pwm.setValue(180)
@@ -284,6 +276,15 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.addWidget(QtWidgets.QLabel("Orchestrator Status:"))
         layout.addWidget(self.orchestrator_log)
 
+    def update_spinbox_limits(self, load_type):
+        """Dynamically updates the min/max limits of all input boxes based on the load type."""
+        limits = LOAD_LIMITS[load_type]
+        # Mode 1 limits
+        self.target_input.setRange(limits["floor"], limits["ceil"])
+        # Mode 2 limits
+        self.chg_v.setRange(limits["floor"], limits["ceil"])
+        self.dchg_v.setRange(limits["floor"], limits["ceil"])
+
     def log_orchestrator(self, msg):
         self.orchestrator_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
 
@@ -306,24 +307,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_start_manual.setEnabled(False)
         self.serial_input.setEnabled(False)
         self.load_dropdown.setEnabled(False)
-        self.tabs.setTabEnabled(1, False) # Disable auto tab
+        self.tabs.setTabEnabled(1, False)
 
     def start_auto_test(self):
         dut_serial = self.validate_serial()
         if not dut_serial: return
 
-        # Verify limits before starting
         load_type = self.load_dropdown.currentText()
-        limits = LOAD_LIMITS[load_type]
-        if self.chg_v.value() > limits["ceil"] or self.dchg_v.value() < limits["floor"]:
-            QMessageBox.critical(self, "Limit Error", "Profile parameters exceed safety limits for selected Load Type.")
-            return
-
+        
         self.worker = SerialWorker(port='COM6', dut_serial=dut_serial, mode_folder='cycle-data')
         self.worker.new_data_signal.connect(self.update_gui)
         self.worker.start()
 
-        # Initialize State Machine
         self.worker.send_command(f"LOAD {load_type}")
         self.auto_mode_active = True
         self.sm_state = "START_CHARGE"
@@ -334,7 +329,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_start_auto.setEnabled(False)
         self.serial_input.setEnabled(False)
         self.load_dropdown.setEnabled(False)
-        self.tabs.setTabEnabled(0, False) # Disable manual tab
+        self.tabs.setTabEnabled(0, False)
         self.log_orchestrator(f"Starting Profile. Total Cycles: {self.sm_cycles_total}")
 
     def emergency_stop(self):
@@ -347,15 +342,33 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_start_auto.setEnabled(True)
 
     def send_target_command(self):
-        if not hasattr(self, 'worker') or not self.worker.is_running: return
-        self.worker.send_command(f"TARGET {self.target_input.value():.2f}")
+        if not hasattr(self, 'worker') or not self.worker.is_running:
+            QMessageBox.warning(self, "Error", "Please start manual logging first.")
+            return
+            
+        target_v = self.target_input.value()
+        load_type = self.load_dropdown.currentText()
+        limits = LOAD_LIMITS[load_type]
+
+        # Defense-in-depth: Explicit code block just in case UI bounds fail
+        if target_v > limits["ceil"]:
+            QMessageBox.critical(self, "Limit Exceeded", f"Target Voltage exceeds {limits['ceil']}V ceiling!")
+            self.target_input.setValue(limits["ceil"])
+            return
+        if target_v < limits["floor"]:
+            QMessageBox.critical(self, "Limit Exceeded", f"Target Voltage is below {limits['floor']}V floor!")
+            self.target_input.setValue(limits["floor"])
+            return
+
+        self.worker.send_command(f"TARGET {target_v:.2f}")
 
     def send_pwm_command(self):
-        if not hasattr(self, 'worker') or not self.worker.is_running: return
+        if not hasattr(self, 'worker') or not self.worker.is_running:
+            QMessageBox.warning(self, "Error", "Please start manual logging first.")
+            return
         self.worker.send_command(f"PWM {self.pwm_input.value()}")
 
     def update_gui(self, data):
-        # Update text readout
         status_text = (f"STATE: {data['state']} | LOAD: {data['load_type']} | "
                        f"V_cell: {data['cell_v']:.3f}V (Tgt: {data['target_v']:.2f}V) | "
                        f"I: {data['current_ma']:.1f}mA")
@@ -372,7 +385,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self.tick_state_machine(data)
 
     def tick_state_machine(self, data):
-        """The Orchestrator logic evaluated every 250ms"""
         hw_state = data['state']
 
         if self.sm_state == "START_CHARGE":
@@ -383,7 +395,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         elif self.sm_state == "WAIT_CHARGE_DONE":
             if hw_state == "DONE":
-                self.worker.send_command("PWM 130") # Hardware off for rest
+                self.worker.send_command("PWM 130") 
                 self.sm_timer_start = time.time()
                 self.log_orchestrator(f"Charge complete. Resting for {self.sm_rest_duration}s...")
                 self.sm_state = "REST_POST_CHARGE"
@@ -417,7 +429,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def closeEvent(self, event):
         if hasattr(self, 'worker') and self.worker.is_running:
-            self.emergency_stop() # Ensure hardware is safe before closing
+            self.emergency_stop()
             self.worker.stop()
         event.accept()
 
