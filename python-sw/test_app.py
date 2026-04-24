@@ -41,12 +41,9 @@ class SerialWorker(QtCore.QThread):
     def run(self):
         try:
             ser = serial.Serial(self.port, self.baudrate, timeout=0.1)
-            
-            # Bootloader Delay: Wait 2.0s for hardware reset, flush buffers
             time.sleep(2.0)
             ser.reset_input_buffer() 
             ser.reset_output_buffer()
-            
         except Exception as e:
             print(f"Failed to connect to {self.port}: {e}")
             return
@@ -97,7 +94,7 @@ class SerialWorker(QtCore.QThread):
                                 "discharge_mah": discharge_mah
                             })
                 except Exception:
-                    pass # Silently drop parse errors caused by noise
+                    pass
 
         ser.close()
 
@@ -109,18 +106,28 @@ class SerialWorker(QtCore.QThread):
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Battery Cycler DAQ - Phase 2")
-        self.resize(1100, 850)
+        self.setWindowTitle("Battery Cycler DAQ - Phase 2 with Analytics")
+        self.resize(1400, 950) # Expanded for new plots
 
+        # Buffers for continuous live plots
         self.plot_points = 1000
         self.time_data = deque(maxlen=self.plot_points)
         self.volt_data = deque(maxlen=self.plot_points)
         self.curr_data = deque(maxlen=self.plot_points)
+        
+        # Buffers for V-I Scatter (Clears dynamically, unbounded during single action)
+        self.vi_v_data = []
+        self.vi_i_data = []
+
+        # Buffers for Mode 2 Cycle Analytics
+        self.cycle_nums = []
+        self.discharge_caps = []
+        self.ce_percents = []
+        self.last_charge_cap = 0.0 # Snapshot variable
 
         os.makedirs("test-data", exist_ok=True)
         os.makedirs("cycle-data", exist_ok=True)
         
-        # State Machine Variables
         self.auto_mode_active = False
         self.sm_state = "IDLE"
         self.sm_cycles_total = 0
@@ -162,24 +169,39 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setup_manual_tab()
         self.setup_auto_tab()
 
-        # Shared Readouts & Plots
+        # Shared Readouts
         self.readout_label = QtWidgets.QLabel("System Idle. Awaiting test start...")
         self.readout_label.setFont(QFont("Monospace", 12, QFont.Weight.Bold))
         self.readout_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
         main_layout.addWidget(self.readout_label)
 
+        # Shared Live Plots Layout (V-t, I-t, and V-I)
         pg.setConfigOptions(antialias=True)
+        plots_layout = QtWidgets.QGridLayout()
+        
         self.plot_v = pg.PlotWidget(title="Cell Voltage vs Time")
         self.plot_v.showGrid(x=True, y=True)
         self.line_v = self.plot_v.plot(pen=pg.mkPen('y', width=2))
-        main_layout.addWidget(self.plot_v)
+        plots_layout.addWidget(self.plot_v, 0, 0)
 
         self.plot_i = pg.PlotWidget(title="Current vs Time")
         self.plot_i.showGrid(x=True, y=True)
         self.line_i = self.plot_i.plot(pen=pg.mkPen('c', width=2))
-        main_layout.addWidget(self.plot_i)
+        plots_layout.addWidget(self.plot_i, 1, 0)
 
-        # Connect dropdown to dynamically update input limits, then initialize it
+        # New: Live V-I Scatter Plot
+        self.plot_vi = pg.PlotWidget(title="Real-Time V-I Curve")
+        self.plot_vi.setLabel('left', 'Current', units='mA')
+        self.plot_vi.setLabel('bottom', 'Voltage', units='V')
+        self.plot_vi.showGrid(x=True, y=True)
+        # using pen=None and symbol='o' mimics a scatter plot but renders significantly faster
+        self.line_vi = self.plot_vi.plot(pen=None, symbol='o', symbolSize=4, symbolPen=None, symbolBrush='m')
+        plots_layout.addWidget(self.plot_vi, 0, 1, 2, 1) # Span 2 rows
+        
+        plots_layout.setColumnStretch(0, 2)
+        plots_layout.setColumnStretch(1, 1)
+        main_layout.addLayout(plots_layout)
+
         self.load_dropdown.currentTextChanged.connect(self.update_spinbox_limits)
         self.update_spinbox_limits(self.load_dropdown.currentText())
 
@@ -215,11 +237,14 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.addStretch()
 
     def setup_auto_tab(self):
-        layout = QtWidgets.QVBoxLayout(self.tab_auto)
+        # Master layout for Mode 2 Tab: Left side controls, Right side analytics
+        master_layout = QtWidgets.QHBoxLayout(self.tab_auto)
         
-        # Auto Parameters
+        # --- LEFT: Controls ---
+        controls_widget = QtWidgets.QWidget()
+        controls_layout = QtWidgets.QVBoxLayout(controls_widget)
+        
         param_layout = QtWidgets.QGridLayout()
-        
         self.chg_v = QtWidgets.QDoubleSpinBox()
         self.chg_v.setSingleStep(0.1)
         self.chg_pwm = QtWidgets.QSpinBox()
@@ -253,10 +278,8 @@ class MainWindow(QtWidgets.QMainWindow):
         param_layout.addWidget(self.rest_t, 2, 1)
         param_layout.addWidget(QtWidgets.QLabel("Total Cycles:"), 2, 2)
         param_layout.addWidget(self.cycles_n, 2, 3)
-        
-        layout.addLayout(param_layout)
+        controls_layout.addLayout(param_layout)
 
-        # Buttons
         btn_layout = QtWidgets.QHBoxLayout()
         self.btn_start_auto = QtWidgets.QPushButton("START AUTO-CYCLE")
         self.btn_start_auto.setStyleSheet("background-color: darkgreen; color: white; font-weight: bold; padding: 10px;")
@@ -268,20 +291,41 @@ class MainWindow(QtWidgets.QMainWindow):
         
         btn_layout.addWidget(self.btn_start_auto)
         btn_layout.addWidget(self.btn_estop)
-        layout.addLayout(btn_layout)
+        controls_layout.addLayout(btn_layout)
 
         self.orchestrator_log = QtWidgets.QTextEdit()
         self.orchestrator_log.setReadOnly(True)
         self.orchestrator_log.setMaximumHeight(100)
-        layout.addWidget(QtWidgets.QLabel("Orchestrator Status:"))
-        layout.addWidget(self.orchestrator_log)
+        controls_layout.addWidget(QtWidgets.QLabel("Orchestrator Status:"))
+        controls_layout.addWidget(self.orchestrator_log)
+        
+        master_layout.addWidget(controls_widget)
+
+        # --- RIGHT: Analytics Plots ---
+        analytics_widget = QtWidgets.QWidget()
+        analytics_layout = QtWidgets.QVBoxLayout(analytics_widget)
+        
+        self.plot_cap = pg.PlotWidget(title="Discharge Capacity Degradation")
+        self.plot_cap.setLabel('left', 'Capacity', units='mAh')
+        self.plot_cap.setLabel('bottom', 'Cycle Number')
+        self.plot_cap.showGrid(x=True, y=True)
+        self.line_cap = self.plot_cap.plot(pen=pg.mkPen('g', width=2), symbol='s')
+        analytics_layout.addWidget(self.plot_cap)
+
+        self.plot_ce = pg.PlotWidget(title="Coulombic Efficiency")
+        self.plot_ce.setLabel('left', 'Efficiency', units='%')
+        self.plot_ce.setLabel('bottom', 'Cycle Number')
+        self.plot_ce.showGrid(x=True, y=True)
+        self.line_ce = self.plot_ce.plot(pen=pg.mkPen('b', width=2), symbol='t')
+        analytics_layout.addWidget(self.plot_ce)
+        
+        master_layout.addWidget(analytics_widget)
+        master_layout.setStretch(0, 1) # Controls take less space
+        master_layout.setStretch(1, 1) # Analytics take equal space
 
     def update_spinbox_limits(self, load_type):
-        """Dynamically updates the min/max limits of all input boxes based on the load type."""
         limits = LOAD_LIMITS[load_type]
-        # Mode 1 limits
         self.target_input.setRange(limits["floor"], limits["ceil"])
-        # Mode 2 limits
         self.chg_v.setRange(limits["floor"], limits["ceil"])
         self.dchg_v.setRange(limits["floor"], limits["ceil"])
 
@@ -294,6 +338,12 @@ class MainWindow(QtWidgets.QMainWindow):
             QMessageBox.warning(self, "Validation Error", "Please enter exactly a 7-digit Serial Number.")
             return None
         return dut_serial
+
+    def clear_vi_plot(self):
+        """Clears the real-time scatter buffers for a new event."""
+        self.vi_v_data.clear()
+        self.vi_i_data.clear()
+        self.line_vi.setData([], [])
 
     def start_manual_test(self):
         dut_serial = self.validate_serial()
@@ -314,10 +364,16 @@ class MainWindow(QtWidgets.QMainWindow):
         if not dut_serial: return
 
         load_type = self.load_dropdown.currentText()
-        
         self.worker = SerialWorker(port='COM6', dut_serial=dut_serial, mode_folder='cycle-data')
         self.worker.new_data_signal.connect(self.update_gui)
         self.worker.start()
+
+        # Reset cycle analytics
+        self.cycle_nums.clear()
+        self.discharge_caps.clear()
+        self.ce_percents.clear()
+        self.line_cap.setData([], [])
+        self.line_ce.setData([], [])
 
         self.worker.send_command(f"LOAD {load_type}")
         self.auto_mode_active = True
@@ -350,22 +406,19 @@ class MainWindow(QtWidgets.QMainWindow):
         load_type = self.load_dropdown.currentText()
         limits = LOAD_LIMITS[load_type]
 
-        # Defense-in-depth: Explicit code block just in case UI bounds fail
-        if target_v > limits["ceil"]:
-            QMessageBox.critical(self, "Limit Exceeded", f"Target Voltage exceeds {limits['ceil']}V ceiling!")
-            self.target_input.setValue(limits["ceil"])
-            return
-        if target_v < limits["floor"]:
-            QMessageBox.critical(self, "Limit Exceeded", f"Target Voltage is below {limits['floor']}V floor!")
-            self.target_input.setValue(limits["floor"])
+        if target_v > limits["ceil"] or target_v < limits["floor"]:
+            QMessageBox.critical(self, "Limit Exceeded", f"Voltage out of bounds for {load_type}!")
             return
 
+        self.clear_vi_plot() # Clear V-I on new manual action
         self.worker.send_command(f"TARGET {target_v:.2f}")
 
     def send_pwm_command(self):
         if not hasattr(self, 'worker') or not self.worker.is_running:
             QMessageBox.warning(self, "Error", "Please start manual logging first.")
             return
+        
+        self.clear_vi_plot() # Clear V-I on new manual action
         self.worker.send_command(f"PWM {self.pwm_input.value()}")
 
     def update_gui(self, data):
@@ -374,12 +427,18 @@ class MainWindow(QtWidgets.QMainWindow):
                        f"I: {data['current_ma']:.1f}mA")
         self.readout_label.setText(status_text)
 
+        # 1. Update Continuous Plots
         self.time_data.append(data['time'])
         self.volt_data.append(data['cell_v'])
         self.curr_data.append(data['current_ma'])
 
         self.line_v.setData(self.time_data, self.volt_data)
         self.line_i.setData(self.time_data, self.curr_data)
+
+        # 2. Update V-I Scatter Curve
+        self.vi_v_data.append(data['cell_v'])
+        self.vi_i_data.append(data['current_ma'])
+        self.line_vi.setData(self.vi_v_data, self.vi_i_data)
 
         if self.auto_mode_active:
             self.tick_state_machine(data)
@@ -388,13 +447,15 @@ class MainWindow(QtWidgets.QMainWindow):
         hw_state = data['state']
 
         if self.sm_state == "START_CHARGE":
+            self.clear_vi_plot() # Clear V-I curve for new action
             self.worker.send_command(f"TARGET {self.chg_v.value():.2f}")
             self.worker.send_command(f"PWM {self.chg_pwm.value()}")
-            self.log_orchestrator(f"Cycle {self.sm_cycles_done + 1}/{self.sm_cycles_total}: Charging to {self.chg_v.value()}V...")
+            self.log_orchestrator(f"Cycle {self.sm_cycles_done + 1}/{self.sm_cycles_total}: Charging...")
             self.sm_state = "WAIT_CHARGE_DONE"
 
         elif self.sm_state == "WAIT_CHARGE_DONE":
             if hw_state == "DONE":
+                self.last_charge_cap = data['charge_mah'] # SNAPSHOT CHARGE CAPACITY
                 self.worker.send_command("PWM 130") 
                 self.sm_timer_start = time.time()
                 self.log_orchestrator(f"Charge complete. Resting for {self.sm_rest_duration}s...")
@@ -405,21 +466,34 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.sm_state = "START_DISCHARGE"
 
         elif self.sm_state == "START_DISCHARGE":
+            self.clear_vi_plot() # Clear V-I curve for new action
             self.worker.send_command(f"TARGET {self.dchg_v.value():.2f}")
             self.worker.send_command(f"PWM {self.dchg_pwm.value()}")
-            self.log_orchestrator(f"Cycle {self.sm_cycles_done + 1}/{self.sm_cycles_total}: Discharging to {self.dchg_v.value()}V...")
+            self.log_orchestrator(f"Cycle {self.sm_cycles_done + 1}/{self.sm_cycles_total}: Discharging...")
             self.sm_state = "WAIT_DISCHARGE_DONE"
 
         elif self.sm_state == "WAIT_DISCHARGE_DONE":
             if hw_state == "DONE":
+                final_dchg_cap = data['discharge_mah'] # SNAPSHOT DISCHARGE CAPACITY
                 self.worker.send_command("PWM 130")
+                
+                # Update Cycle Analytics
+                self.sm_cycles_done += 1
+                ce = (final_dchg_cap / self.last_charge_cap * 100.0) if self.last_charge_cap > 0 else 0.0
+                
+                self.cycle_nums.append(self.sm_cycles_done)
+                self.discharge_caps.append(final_dchg_cap)
+                self.ce_percents.append(ce)
+                
+                self.line_cap.setData(self.cycle_nums, self.discharge_caps)
+                self.line_ce.setData(self.cycle_nums, self.ce_percents)
+                
                 self.sm_timer_start = time.time()
-                self.log_orchestrator(f"Discharge complete. Resting for {self.sm_rest_duration}s...")
+                self.log_orchestrator(f"Discharge complete. CE: {ce:.1f}%. Resting...")
                 self.sm_state = "REST_POST_DISCHARGE"
 
         elif self.sm_state == "REST_POST_DISCHARGE":
             if (time.time() - self.sm_timer_start) >= self.sm_rest_duration:
-                self.sm_cycles_done += 1
                 if self.sm_cycles_done < self.sm_cycles_total:
                     self.sm_state = "START_CHARGE"
                 else:
