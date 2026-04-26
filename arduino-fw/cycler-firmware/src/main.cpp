@@ -1,6 +1,6 @@
 /**
- * PUDELstat Firmware - Coulomb Counting Edition
- * Features: A3 Diff Current, HW Latch, Dual-Direction Capacity Integration
+ * PUDELstat Firmware - Galvanostatic (CC) Stepper Edition
+ * Features: CC/CV Profiling, A3 Diff Current, HW Latch, Coulomb Counting
  * Calibrated Zero: PWM 130 | Calibrated Gain: 0.0730
  */
 
@@ -21,10 +21,14 @@ const float ADC_VOLT_GAIN = (5.00 / 1023.0);
 enum SystemState { AWAITING_LOAD, AWAITING_TARGET, IDLE, RUNNING, ERROR, TARGET_REACHED };
 SystemState currentState = AWAITING_LOAD;
 
+enum ControlMode { MODE_PWM, MODE_CC };
+ControlMode activeControlMode = MODE_PWM;
+
 String currentLoadName = "NONE";
 float maxAllowableCeiling = 0.0;
 float safeFloorVoltage = 0.0;
 float targetVoltage = 0.0;
+float targetCurrent_mA = 0.0;
 uint8_t currentPWMCommand = 130; 
 
 // --- COULOMB COUNTING VARIABLES ---
@@ -59,10 +63,8 @@ void setup() {
     setupTimer1_31kHz();
     setPWMDuty(130); 
     
-    Serial.println("SYSTEM BOOT: Allowing analog hardware to settle...");
     delay(1000); 
     
-    Serial.println("SYSTEM BOOT: Calibrating Differential Zero Point...");
     long sumOffset = 0;
     for(int i = 0; i < 100; i++) {
         sumOffset += (analogRead(PIN_CURR_SENSE) - analogRead(PIN_VIRT_GND_SENSE));
@@ -72,21 +74,12 @@ void setup() {
     
     EIFR = bit(INTF0); 
     attachInterrupt(digitalPinToInterrupt(PIN_FAULT_INTERRUPT), hardwareFaultISR, FALLING);
-    
-    Serial.print("CALIBRATION COMPLETE. Base Offset ADC: ");
-    Serial.println(ZERO_OFFSET_ADC, 2);
-    Serial.println("\n>>> SYSTEM LOCKED. Select Load Type First.");
-    Serial.println(">>> Send 'LOAD SUPERCAP', 'LOAD NIMH', 'LOAD RESISTOR', or 'LOAD CUSTOM'.");
 }
 
 void loop() {
     if (hardwareFaultDetected && currentState != ERROR) {
         currentState = ERROR;
-        Serial.println("\n==================================================");
-        Serial.println(">>> CRITICAL ALARM: HARDWARE FAULT TRIPPED <<<");
-        Serial.println(">>> RELAY OPENED. PWM LATCHED TO 130 (0mA). <<<");
-        Serial.println(">>> SYSTEM LOCKED. PRESS RESET BUTTON TO CLEAR. <<<");
-        Serial.println("==================================================\n");
+        Serial.println("ERROR,HARDWARE_FAULT_LATCHED");
     }
 
     long sumVolt = 0;
@@ -110,6 +103,30 @@ void loop() {
     float rawDiffADC = avgCurrADC - avgVirtGndADC;
     float c = (rawDiffADC - ZERO_OFFSET_ADC) * ADC_CURR_GAIN_MA;
     
+    // --- GALVANOSTATIC (CC) MICRO-STEPPER ---
+    if (currentState == RUNNING && activeControlMode == MODE_CC) {
+        // CHARGING CC (Positive Target)
+        if (targetCurrent_mA > 0.1) {
+            if (c < (targetCurrent_mA - 0.08) && currentPWMCommand > 0) {
+                currentPWMCommand--; // Push harder
+                setPWMDuty(currentPWMCommand);
+            } else if (c > (targetCurrent_mA + 0.08) && currentPWMCommand < 129) {
+                currentPWMCommand++; // Push less
+                setPWMDuty(currentPWMCommand);
+            }
+        }
+        // DISCHARGING CC (Negative Target)
+        else if (targetCurrent_mA < -0.1) {
+            if (c > (targetCurrent_mA + 0.08) && currentPWMCommand < 255) {
+                currentPWMCommand++; // Pull harder
+                setPWMDuty(currentPWMCommand);
+            } else if (c < (targetCurrent_mA - 0.08) && currentPWMCommand > 131) {
+                currentPWMCommand--; // Pull less
+                setPWMDuty(currentPWMCommand);
+            }
+        }
+    }
+    
     // --- COULOMB COUNTING INTEGRATION ---
     unsigned long currentTime = millis();
     if (currentState == RUNNING) {
@@ -117,21 +134,20 @@ void loop() {
         float hoursElapsed = deltaT_ms / 3600000.0;
         
         if (currentPWMCommand < 130) {
-            totalCharge_mAh += (c * hoursElapsed); // Current is positive
+            totalCharge_mAh += (c * hoursElapsed); 
         } else if (currentPWMCommand > 130) {
-            totalDischarge_mAh += (abs(c) * hoursElapsed); // Current is negative
+            totalDischarge_mAh += (abs(c) * hoursElapsed); 
         }
     }
     lastIntegrationTime = currentTime;
     
+    // --- GRACEFUL SOFTWARE CUTOFFS ---
     if (currentState == RUNNING) {
         if (currentPWMCommand < 130) {
             if (true_cap_voltage >= targetVoltage || true_cap_voltage >= maxAllowableCeiling) {
                 setPWMDuty(130);
                 currentPWMCommand = 130;
                 currentState = TARGET_REACHED;
-                Serial.println("\n>>> GRACEFUL STOP: Upper Target Reached! <<<");
-                Serial.println(">>> Current Halted. Set new TARGET to continue.\n");
             }
         }
         else if (currentPWMCommand > 130) {
@@ -139,20 +155,14 @@ void loop() {
                 setPWMDuty(130);
                 currentPWMCommand = 130;
                 currentState = TARGET_REACHED;
-                Serial.println("\n>>> GRACEFUL STOP: Lower Target Reached! <<<");
-                Serial.println(">>> Current Halted. Set new TARGET to continue.\n");
             }
         }
     }
     
-    // 4. PRINT TELEMETRY (Machine-Readable CSV Format)
+    // --- PRINT TELEMETRY (CSV FORMAT FOR PYTHON) ---
     if (millis() - lastTelemetryTime >= 250) {
-        if (currentState == ERROR) {
-            Serial.print("ERROR,");
-            Serial.print(absolute_ce, 3); Serial.print(",");
-            Serial.println(absolute_we, 3);
-        } else {
-            Serial.print("DATA,"); // Prefix to tell Python this is valid telemetry
+        if (currentState != ERROR) {
+            Serial.print("DATA,"); 
             
             if (currentState == AWAITING_LOAD) Serial.print("WAIT_LOAD,");
             else if (currentState == AWAITING_TARGET) Serial.print("WAIT_TGT,");
@@ -191,10 +201,7 @@ void handleSerialCommands() {
         cmd.trim();
         cmd.toUpperCase(); 
         
-        if (currentState == ERROR) {
-            Serial.println(">>> REJECTED: SYSTEM IS IN ERROR LOCKOUT.");
-            return;
-        }
+        if (currentState == ERROR) return;
 
         if (cmd.startsWith("LOAD ")) {
             String type = cmd.substring(5);
@@ -214,59 +221,52 @@ void handleSerialCommands() {
                 currentLoadName = "CUSTOM";
                 safeFloorVoltage = -4.80;
                 maxAllowableCeiling = 4.80;
-            } else {
-                Serial.println(">>> ERROR: Unknown load type.");
-                return;
-            }
+            } 
             
             currentState = AWAITING_TARGET;
             setPWMDuty(130); 
             currentPWMCommand = 130;
-            Serial.print("\n>>> LOAD SET: "); Serial.println(currentLoadName);
-            Serial.print(">>> Guardrails Locked -> Floor: "); Serial.print(safeFloorVoltage, 2);
-            Serial.print("V, Ceiling: "); Serial.print(maxAllowableCeiling, 2); Serial.println("V");
-            Serial.println(">>> Send 'TARGET <volts>' to set your destination.\n");
         }
         else if (cmd.startsWith("TARGET ")) {
-            if (currentState == AWAITING_LOAD) {
-                Serial.println(">>> REJECTED: You must select a LOAD type first.");
-                return;
-            }
             float requestedTarget = cmd.substring(7).toFloat();
             if (requestedTarget >= safeFloorVoltage && requestedTarget <= maxAllowableCeiling) {
                 targetVoltage = requestedTarget;
                 currentState = IDLE;
-                
-                // Reset capacity counters when a new cycle target is set
                 totalCharge_mAh = 0.0;
                 totalDischarge_mAh = 0.0;
-                
-                Serial.print("\n>>> TARGET SET: "); 
-                Serial.print(targetVoltage, 2); 
-                Serial.println("V");
-                Serial.println(">>> Send 'PWM <0-129>' to Charge. Send 'PWM <131-255>' to Discharge.\n");
-            } else {
-                Serial.print(">>> ERROR: Target must be between ");
-                Serial.print(safeFloorVoltage, 2); Serial.print("V and ");
-                Serial.print(maxAllowableCeiling, 2); Serial.println("V for this load.");
-            }
+            } 
         } 
         else if (cmd.startsWith("PWM ")) {
-            if (currentState == AWAITING_LOAD || currentState == AWAITING_TARGET) {
-                Serial.println(">>> REJECTED: Setup LOAD and TARGET first.");
-                return;
-            }
             int val = cmd.substring(4).toInt();
             if (val >= 0 && val <= 255) {
+                activeControlMode = MODE_PWM;
                 currentPWMCommand = val;
                 setPWMDuty(val);
                 currentState = RUNNING;
-                lastIntegrationTime = millis(); // Reset timer right as current begins
-                Serial.print(">>> COMMAND ACCEPTED: PWM = ");
-                Serial.println(val);
+                lastIntegrationTime = millis(); 
+            } 
+        }
+        else if (cmd.startsWith("CURRENT ")) {
+            float val = cmd.substring(8).toFloat();
+            // Hard limit guardrails just to be safe
+            if (val > 8.0) val = 8.0;
+            if (val < -8.0) val = -8.0;
+            
+            targetCurrent_mA = val;
+            activeControlMode = MODE_CC;
+            
+            // Set initial trickling PWM based on direction
+            if (targetCurrent_mA > 0.1) {
+                currentPWMCommand = 129;
+            } else if (targetCurrent_mA < -0.1) {
+                currentPWMCommand = 131;
             } else {
-                Serial.println(">>> ERROR: PWM must be 0-255");
+                currentPWMCommand = 130;
             }
+            
+            setPWMDuty(currentPWMCommand);
+            currentState = RUNNING;
+            lastIntegrationTime = millis();
         }
     }
 }
