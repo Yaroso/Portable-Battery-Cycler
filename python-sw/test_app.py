@@ -11,12 +11,12 @@ from PyQt6.QtWidgets import QMessageBox
 from PyQt6.QtGui import QIntValidator, QFont
 import pyqtgraph as pg
 
-# --- LIMITS DICTIONARY ---
+# --- LIMITS DICTIONARY (UPDATED FOR CC MODE) ---
 LOAD_LIMITS = {
-    "SUPERCAP": {"floor": 0.05, "ceil": 2.30},
-    "NIMH": {"floor": 1.00, "ceil": 1.45},
-    "RESISTOR": {"floor": -2.30, "ceil": 2.30},
-    "CUSTOM": {"floor": -4.80, "ceil": 4.80}
+    "SUPERCAP": {"floor": 0.05, "ceil": 2.30, "cc_allowed": True, "i_min": -7.75, "i_max": 5.75},
+    "NIMH": {"floor": 1.00, "ceil": 1.45, "cc_allowed": True, "i_min": -7.75, "i_max": 5.75},
+    "RESISTOR": {"floor": -2.30, "ceil": 2.30, "cc_allowed": False, "i_min": 0.0, "i_max": 0.0},
+    "CUSTOM": {"floor": -4.80, "ceil": 4.80, "cc_allowed": True, "i_min": -8.0, "i_max": 8.0}
 }
 
 # --- THREAD 1: Serial I/O & Logging ---
@@ -113,7 +113,7 @@ class SerialWorker(QtCore.QThread):
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Battery Cycler DAQ - Phase 2 with Analytics")
+        self.setWindowTitle("Battery Cycler DAQ - Phase 2 (CC Upgrade)")
         self.resize(1400, 950)
 
         self.plot_points = 1000
@@ -130,7 +130,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.last_charge_cap = 0.0
         
         self.latest_v_cell = 0.0
-        self.pre_pwm = 130 # Cache for pre-conditioning direction
 
         os.makedirs("test-data", exist_ok=True)
         os.makedirs("cycle-data", exist_ok=True)
@@ -149,6 +148,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setCentralWidget(central_widget)
         main_layout = QtWidgets.QVBoxLayout(central_widget)
 
+        # Global Config
         config_layout = QtWidgets.QHBoxLayout()
         self.serial_input = QtWidgets.QLineEdit()
         self.serial_input.setPlaceholderText("7-digit Serial (e.g. 0000001)")
@@ -164,6 +164,7 @@ class MainWindow(QtWidgets.QMainWindow):
         config_layout.addWidget(self.load_dropdown)
         main_layout.addLayout(config_layout)
 
+        # Tabs
         self.tabs = QtWidgets.QTabWidget()
         self.tab_manual = QtWidgets.QWidget()
         self.tab_auto = QtWidgets.QWidget()
@@ -179,6 +180,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.readout_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
         main_layout.addWidget(self.readout_label)
 
+        # Shared Plots
         pg.setConfigOptions(antialias=True)
         plots_layout = QtWidgets.QGridLayout()
         
@@ -203,8 +205,13 @@ class MainWindow(QtWidgets.QMainWindow):
         plots_layout.setColumnStretch(1, 1)
         main_layout.addLayout(plots_layout)
 
-        self.load_dropdown.currentTextChanged.connect(self.update_spinbox_limits)
-        self.update_spinbox_limits(self.load_dropdown.currentText())
+        # Connect signals for dynamic updates
+        self.load_dropdown.currentTextChanged.connect(self.update_ui_limits)
+        self.m1_ctrl_mode.currentTextChanged.connect(self.toggle_m1_inputs)
+        self.chg_ctrl_mode.currentTextChanged.connect(self.toggle_m2_chg_inputs)
+        self.dchg_ctrl_mode.currentTextChanged.connect(self.toggle_m2_dchg_inputs)
+        
+        self.update_ui_limits(self.load_dropdown.currentText())
 
     def setup_manual_tab(self):
         layout = QtWidgets.QVBoxLayout(self.tab_manual)
@@ -224,22 +231,41 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.addLayout(btn_layout)
 
         ctrl_layout = QtWidgets.QHBoxLayout()
+        
+        # Target Voltage
         self.target_input = QtWidgets.QDoubleSpinBox()
         self.target_input.setSingleStep(0.1)
-        self.btn_target = QtWidgets.QPushButton("Set TARGET")
+        self.btn_target = QtWidgets.QPushButton("Set TARGET V")
         self.btn_target.clicked.connect(self.send_target_command)
         ctrl_layout.addWidget(QtWidgets.QLabel("Target V:"))
         ctrl_layout.addWidget(self.target_input)
         ctrl_layout.addWidget(self.btn_target)
 
+        # Control Mode Toggle
+        self.m1_ctrl_mode = QtWidgets.QComboBox()
+        self.m1_ctrl_mode.addItems(["PWM Control", "Constant Current (CC)"])
+        ctrl_layout.addWidget(QtWidgets.QLabel("Mode:"))
+        ctrl_layout.addWidget(self.m1_ctrl_mode)
+
+        # PWM Input
         self.pwm_input = QtWidgets.QSpinBox()
         self.pwm_input.setRange(0, 255)
         self.pwm_input.setValue(130)
-        self.btn_pwm = QtWidgets.QPushButton("Set PWM")
-        self.btn_pwm.clicked.connect(self.send_pwm_command)
-        ctrl_layout.addWidget(QtWidgets.QLabel("PWM (0-255):"))
+        
+        # CC Input
+        self.m1_cc_input = QtWidgets.QDoubleSpinBox()
+        self.m1_cc_input.setDecimals(2)
+        self.m1_cc_input.setSingleStep(0.5)
+        self.m1_cc_input.setEnabled(False) # Hidden/Disabled by default until CC selected
+
+        self.btn_execute = QtWidgets.QPushButton("Execute Action")
+        self.btn_execute.clicked.connect(self.send_action_command)
+
+        ctrl_layout.addWidget(QtWidgets.QLabel("PWM:"))
         ctrl_layout.addWidget(self.pwm_input)
-        ctrl_layout.addWidget(self.btn_pwm)
+        ctrl_layout.addWidget(QtWidgets.QLabel("CC (mA):"))
+        ctrl_layout.addWidget(self.m1_cc_input)
+        ctrl_layout.addWidget(self.btn_execute)
         
         layout.addLayout(ctrl_layout)
         layout.addStretch()
@@ -251,18 +277,52 @@ class MainWindow(QtWidgets.QMainWindow):
         controls_layout = QtWidgets.QVBoxLayout(controls_widget)
         
         param_layout = QtWidgets.QGridLayout()
+        
+        # Charge Params
         self.chg_v = QtWidgets.QDoubleSpinBox()
         self.chg_v.setSingleStep(0.1)
+        self.chg_ctrl_mode = QtWidgets.QComboBox()
+        self.chg_ctrl_mode.addItems(["PWM", "CC"])
         self.chg_pwm = QtWidgets.QSpinBox()
         self.chg_pwm.setRange(0, 129)
         self.chg_pwm.setValue(80)
+        self.chg_cc = QtWidgets.QDoubleSpinBox()
+        self.chg_cc.setDecimals(2)
+        self.chg_cc.setSingleStep(0.5)
+        self.chg_cc.setEnabled(False)
+
+        param_layout.addWidget(QtWidgets.QLabel("Charge Target (V):"), 0, 0)
+        param_layout.addWidget(self.chg_v, 0, 1)
+        param_layout.addWidget(QtWidgets.QLabel("Mode:"), 0, 2)
+        param_layout.addWidget(self.chg_ctrl_mode, 0, 3)
+        param_layout.addWidget(QtWidgets.QLabel("PWM:"), 0, 4)
+        param_layout.addWidget(self.chg_pwm, 0, 5)
+        param_layout.addWidget(QtWidgets.QLabel("CC (mA):"), 0, 6)
+        param_layout.addWidget(self.chg_cc, 0, 7)
         
+        # Discharge Params
         self.dchg_v = QtWidgets.QDoubleSpinBox()
         self.dchg_v.setSingleStep(0.1)
+        self.dchg_ctrl_mode = QtWidgets.QComboBox()
+        self.dchg_ctrl_mode.addItems(["PWM", "CC"])
         self.dchg_pwm = QtWidgets.QSpinBox()
         self.dchg_pwm.setRange(131, 255)
         self.dchg_pwm.setValue(180)
+        self.dchg_cc = QtWidgets.QDoubleSpinBox()
+        self.dchg_cc.setDecimals(2)
+        self.dchg_cc.setSingleStep(0.5)
+        self.dchg_cc.setEnabled(False)
 
+        param_layout.addWidget(QtWidgets.QLabel("Dischg Target (V):"), 1, 0)
+        param_layout.addWidget(self.dchg_v, 1, 1)
+        param_layout.addWidget(QtWidgets.QLabel("Mode:"), 1, 2)
+        param_layout.addWidget(self.dchg_ctrl_mode, 1, 3)
+        param_layout.addWidget(QtWidgets.QLabel("PWM:"), 1, 4)
+        param_layout.addWidget(self.dchg_pwm, 1, 5)
+        param_layout.addWidget(QtWidgets.QLabel("CC (mA):"), 1, 6)
+        param_layout.addWidget(self.dchg_cc, 1, 7)
+
+        # Cycle Config
         self.rest_t = QtWidgets.QSpinBox()
         self.rest_t.setRange(0, 3600)
         self.rest_t.setValue(10)
@@ -270,20 +330,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.cycles_n.setRange(1, 10000)
         self.cycles_n.setValue(5)
 
-        param_layout.addWidget(QtWidgets.QLabel("Charge Target (V):"), 0, 0)
-        param_layout.addWidget(self.chg_v, 0, 1)
-        param_layout.addWidget(QtWidgets.QLabel("Charge PWM:"), 0, 2)
-        param_layout.addWidget(self.chg_pwm, 0, 3)
-
-        param_layout.addWidget(QtWidgets.QLabel("Dischg Target (V):"), 1, 0)
-        param_layout.addWidget(self.dchg_v, 1, 1)
-        param_layout.addWidget(QtWidgets.QLabel("Dischg PWM:"), 1, 2)
-        param_layout.addWidget(self.dchg_pwm, 1, 3)
-
         param_layout.addWidget(QtWidgets.QLabel("Rest Time (s):"), 2, 0)
         param_layout.addWidget(self.rest_t, 2, 1)
         param_layout.addWidget(QtWidgets.QLabel("Total Cycles:"), 2, 2)
         param_layout.addWidget(self.cycles_n, 2, 3)
+        
         controls_layout.addLayout(param_layout)
 
         btn_layout = QtWidgets.QHBoxLayout()
@@ -307,6 +358,7 @@ class MainWindow(QtWidgets.QMainWindow):
         
         master_layout.addWidget(controls_widget)
 
+        # Analytics
         analytics_widget = QtWidgets.QWidget()
         analytics_layout = QtWidgets.QVBoxLayout(analytics_widget)
         
@@ -328,14 +380,56 @@ class MainWindow(QtWidgets.QMainWindow):
         master_layout.setStretch(0, 1) 
         master_layout.setStretch(1, 1) 
 
-    def update_spinbox_limits(self, load_type):
+    def update_ui_limits(self, load_type):
         limits = LOAD_LIMITS[load_type]
+        
+        # Poka-Yoke: Offset limits by 20mV
         safe_floor = limits["floor"] + 0.02
         safe_ceil = limits["ceil"] - 0.02
-        
         self.target_input.setRange(safe_floor, safe_ceil)
         self.chg_v.setRange(safe_floor, safe_ceil)
         self.dchg_v.setRange(safe_floor, safe_ceil)
+
+        # CC Limits and Toggles
+        cc_allowed = limits["cc_allowed"]
+        if not cc_allowed:
+            self.m1_ctrl_mode.setCurrentText("PWM Control")
+            self.chg_ctrl_mode.setCurrentText("PWM")
+            self.dchg_ctrl_mode.setCurrentText("PWM")
+            
+            self.m1_ctrl_mode.setEnabled(False)
+            self.chg_ctrl_mode.setEnabled(False)
+            self.dchg_ctrl_mode.setEnabled(False)
+        else:
+            self.m1_ctrl_mode.setEnabled(True)
+            self.chg_ctrl_mode.setEnabled(True)
+            self.dchg_ctrl_mode.setEnabled(True)
+            
+            # Restrict current input ranges based on Load
+            i_min = limits["i_min"]
+            i_max = limits["i_max"]
+            self.m1_cc_input.setRange(i_min, i_max)
+            self.chg_cc.setRange(0, i_max)         # Charge should be positive
+            self.dchg_cc.setRange(i_min, -0.01)    # Discharge should be negative
+
+        self.toggle_m1_inputs(self.m1_ctrl_mode.currentText())
+        self.toggle_m2_chg_inputs(self.chg_ctrl_mode.currentText())
+        self.toggle_m2_dchg_inputs(self.dchg_ctrl_mode.currentText())
+
+    def toggle_m1_inputs(self, mode_text):
+        is_cc = mode_text == "Constant Current (CC)"
+        self.pwm_input.setEnabled(not is_cc)
+        self.m1_cc_input.setEnabled(is_cc)
+
+    def toggle_m2_chg_inputs(self, mode_text):
+        is_cc = mode_text == "CC"
+        self.chg_pwm.setEnabled(not is_cc)
+        self.chg_cc.setEnabled(is_cc)
+
+    def toggle_m2_dchg_inputs(self, mode_text):
+        is_cc = mode_text == "CC"
+        self.dchg_pwm.setEnabled(not is_cc)
+        self.dchg_cc.setEnabled(is_cc)
 
     def log_orchestrator(self, msg):
         self.orchestrator_log.append(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
@@ -376,9 +470,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tabs.setTabEnabled(1, False)
 
     def start_auto_test(self):
-        # Mathematical Interlock: PEBKAC Safety Check
         if self.chg_v.value() <= self.dchg_v.value():
-            QMessageBox.critical(self, "Mathematical Logic Error", "Charge Target must be strictly greater than Discharge Target to cycle safely.")
+            QMessageBox.critical(self, "Mathematical Logic Error", "Charge Target must be strictly greater than Discharge Target.")
             return
 
         dut_serial = self.validate_serial()
@@ -444,25 +537,36 @@ class MainWindow(QtWidgets.QMainWindow):
         self.worker.send_command("PWM 130")
         self.worker.send_command(f"TARGET {target_v:.2f}")
 
-    def send_pwm_command(self):
+    def send_action_command(self):
         if not hasattr(self, 'worker') or not self.worker.is_running:
             QMessageBox.warning(self, "Error", "Please start manual logging first.")
             return
-            
+
         target_v = self.target_input.value()
-        pwm_val = self.pwm_input.value()
-        
-        if target_v < self.latest_v_cell and pwm_val < 130:
-            QMessageBox.critical(self, "PWM Interlock Error", f"Target ({target_v:.2f}V) is below actual cell voltage ({self.latest_v_cell:.2f}V).\n\nYou must DISCHARGE. PWM must be 130 to 255.")
-            return
-        elif target_v > self.latest_v_cell and pwm_val > 130:
-            QMessageBox.critical(self, "PWM Interlock Error", f"Target ({target_v:.2f}V) is above actual cell voltage ({self.latest_v_cell:.2f}V).\n\nYou must CHARGE. PWM must be 0 to 130.")
-            return
+        is_cc = self.m1_ctrl_mode.currentText() == "Constant Current (CC)"
         
         self.vi_v_data.clear()
         self.vi_i_data.clear()
         self.line_vi.setData([], [])
-        self.worker.send_command(f"PWM {pwm_val}")
+
+        if is_cc:
+            cc_val = self.m1_cc_input.value()
+            if target_v < self.latest_v_cell and cc_val > 0:
+                 QMessageBox.critical(self, "Interlock Error", f"Target ({target_v:.2f}V) is below cell voltage.\nCurrent must be negative (Discharge).")
+                 return
+            elif target_v > self.latest_v_cell and cc_val < 0:
+                 QMessageBox.critical(self, "Interlock Error", f"Target ({target_v:.2f}V) is above cell voltage.\nCurrent must be positive (Charge).")
+                 return
+            self.worker.send_command(f"CURRENT {cc_val:.2f}")
+        else:
+            pwm_val = self.pwm_input.value()
+            if target_v < self.latest_v_cell and pwm_val < 130:
+                QMessageBox.critical(self, "Interlock Error", f"Target ({target_v:.2f}V) is below cell voltage.\nPWM must be 130-255 (Discharge).")
+                return
+            elif target_v > self.latest_v_cell and pwm_val > 130:
+                QMessageBox.critical(self, "Interlock Error", f"Target ({target_v:.2f}V) is above cell voltage.\nPWM must be 0-130 (Charge).")
+                return
+            self.worker.send_command(f"PWM {pwm_val}")
 
     def update_gui(self, data):
         self.latest_v_cell = data['cell_v']
@@ -489,22 +593,22 @@ class MainWindow(QtWidgets.QMainWindow):
     def tick_state_machine(self, data):
         hw_state = data['state']
 
-        # --- SYSTEM INITIALIZATION ---
         if self.sm_state == "WAIT_FOR_LOAD_ACK":
             if data['load_type'] == self.load_dropdown.currentText() and hw_state == "WAIT_TGT":
                 self.sm_state = "START_PRE_CONDITIONING"
 
-        # --- PRE-CONDITIONING SEQUENCE ---
         elif self.sm_state == "START_PRE_CONDITIONING":
             self.pre_target = self.dchg_v.value()
-            self.worker.send_command("PWM 130") # Safely halt hardware
+            self.worker.send_command("PWM 130") 
             
-            # Determine if we need to pre-charge or pre-discharge to hit baseline
+            # Determine Pre-conditioning direction and mode
+            is_cc = self.dchg_ctrl_mode.currentText() == "CC"
+            
             if data['cell_v'] < (self.pre_target - 0.05):
-                self.pre_pwm = self.chg_pwm.value()
+                pre_cmd = f"CURRENT {self.chg_cc.value():.2f}" if self.chg_ctrl_mode.currentText() == "CC" else f"PWM {self.chg_pwm.value()}"
                 action_text = "Charging"
             elif data['cell_v'] > (self.pre_target + 0.05):
-                self.pre_pwm = self.dchg_pwm.value()
+                pre_cmd = f"CURRENT {self.dchg_cc.value():.2f}" if is_cc else f"PWM {self.dchg_pwm.value()}"
                 action_text = "Discharging"
             else:
                 self.log_orchestrator(f"Cell already at baseline ({data['cell_v']:.3f}V). Skipping pre-conditioning.")
@@ -512,7 +616,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 return
 
             self.worker.send_command(f"TARGET {self.pre_target:.2f}")
-            self.worker.send_command(f"PWM {self.pre_pwm}")
+            self.worker.send_command(pre_cmd)
+            self.pre_cmd_cache = pre_cmd # Cache for retry watchdog
             
             self.log_orchestrator(f"Pre-conditioning: {action_text} to baseline ({self.pre_target:.2f}V)...")
             self.sm_timer_start = time.time()
@@ -522,16 +627,15 @@ class MainWindow(QtWidgets.QMainWindow):
             if abs(data['target_v'] - self.pre_target) < 0.05:
                 self.sm_state = "WAIT_PRE_COND_DONE"
             elif time.time() - self.sm_timer_start > 3.0: 
-                self.log_orchestrator("Command dropped. Retrying pre-conditioning commands...")
                 self.worker.send_command("PWM 130")
                 self.worker.send_command(f"TARGET {self.pre_target:.2f}")
-                self.worker.send_command(f"PWM {self.pre_pwm}")
+                self.worker.send_command(self.pre_cmd_cache)
                 self.sm_timer_start = time.time()
                 
         elif self.sm_state == "WAIT_PRE_COND_DONE":
             if hw_state == "DONE":
                 self.worker.send_command("PWM 130") 
-                self.log_orchestrator(f"Baseline reached. Resting for {self.sm_rest_duration}s before Cycle 1...")
+                self.log_orchestrator(f"Baseline reached. Resting for {self.sm_rest_duration}s...")
                 self.sm_timer_start = time.time()
                 self.sm_state = "REST_POST_PRE_COND"
                 
@@ -539,16 +643,16 @@ class MainWindow(QtWidgets.QMainWindow):
             if time.time() - self.sm_timer_start >= self.sm_rest_duration:
                 self.sm_state = "START_CHARGE"
 
-        # --- STANDARD CYCLING SEQUENCE ---
         elif self.sm_state == "START_CHARGE":
             self.vi_v_data.clear()
             self.vi_i_data.clear()
             self.line_vi.setData([], [])
             self.chg_target_cache = self.chg_v.value()
+            self.chg_cmd_cache = f"CURRENT {self.chg_cc.value():.2f}" if self.chg_ctrl_mode.currentText() == "CC" else f"PWM {self.chg_pwm.value()}"
             
             self.worker.send_command("PWM 130")
             self.worker.send_command(f"TARGET {self.chg_target_cache:.2f}")
-            self.worker.send_command(f"PWM {self.chg_pwm.value()}")
+            self.worker.send_command(self.chg_cmd_cache)
             
             self.log_orchestrator(f"Cycle {self.sm_cycles_done + 1}/{self.sm_cycles_total}: Charging...")
             self.sm_timer_start = time.time()
@@ -560,7 +664,7 @@ class MainWindow(QtWidgets.QMainWindow):
             elif time.time() - self.sm_timer_start > 3.0: 
                 self.worker.send_command("PWM 130")
                 self.worker.send_command(f"TARGET {self.chg_target_cache:.2f}")
-                self.worker.send_command(f"PWM {self.chg_pwm.value()}")
+                self.worker.send_command(self.chg_cmd_cache)
                 self.sm_timer_start = time.time()
 
         elif self.sm_state == "WAIT_CHARGE_DONE":
@@ -580,10 +684,11 @@ class MainWindow(QtWidgets.QMainWindow):
             self.vi_i_data.clear()
             self.line_vi.setData([], [])
             self.dchg_target_cache = self.dchg_v.value()
+            self.dchg_cmd_cache = f"CURRENT {self.dchg_cc.value():.2f}" if self.dchg_ctrl_mode.currentText() == "CC" else f"PWM {self.dchg_pwm.value()}"
             
             self.worker.send_command("PWM 130")
             self.worker.send_command(f"TARGET {self.dchg_target_cache:.2f}")
-            self.worker.send_command(f"PWM {self.dchg_pwm.value()}")
+            self.worker.send_command(self.dchg_cmd_cache)
             
             self.log_orchestrator(f"Cycle {self.sm_cycles_done + 1}/{self.sm_cycles_total}: Discharging...")
             self.sm_timer_start = time.time()
@@ -595,7 +700,7 @@ class MainWindow(QtWidgets.QMainWindow):
             elif time.time() - self.sm_timer_start > 3.0: 
                 self.worker.send_command("PWM 130")
                 self.worker.send_command(f"TARGET {self.dchg_target_cache:.2f}")
-                self.worker.send_command(f"PWM {self.dchg_pwm.value()}")
+                self.worker.send_command(self.dchg_cmd_cache)
                 self.sm_timer_start = time.time()
 
         elif self.sm_state == "WAIT_DISCHARGE_DONE":
