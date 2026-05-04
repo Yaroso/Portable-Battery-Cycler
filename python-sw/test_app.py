@@ -14,7 +14,7 @@ import pyqtgraph as pg
 # --- LIMITS DICTIONARY (UPDATED FOR CC MODE) ---
 LOAD_LIMITS = {
     "SUPERCAP": {"floor": 0.05, "ceil": 2.30, "cc_allowed": True, "i_min": -7.75, "i_max": 5.75},
-    "NIMH": {"floor": 1.00, "ceil": 1.45, "cc_allowed": True, "i_min": -7.75, "i_max": 5.75},
+    "NIMH": {"floor": 1.00, "ceil": 1.45, "cc_allowed": True, "i_min": -7.75, "i_max": 7.65},
     "RESISTOR": {"floor": -2.30, "ceil": 2.30, "cc_allowed": False, "i_min": 0.0, "i_max": 0.0},
     "CUSTOM": {"floor": -4.80, "ceil": 4.80, "cc_allowed": True, "i_min": -8.0, "i_max": 8.0}
 }
